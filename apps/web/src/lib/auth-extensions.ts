@@ -12,7 +12,15 @@ import type { NextAuthConfig } from "next-auth";
 
 type Provider = NonNullable<NextAuthConfig["providers"]>[number];
 type SignInUser = { id?: string; email?: string | null; name?: string | null };
-type SignInHook = (user: SignInUser, account: unknown) => Promise<void> | void;
+// A sign-in guard runs in the next-auth `signIn` callback (it can DENY sign-in).
+// Return false (or throw) to reject; void/true allows. Used by the cloud build to
+// link the OAuth identity and refuse unverified-email linking — and to fail
+// closed if persistence fails (so a user never gets a session with no backing row).
+type SignInHook = (
+  user: SignInUser,
+  account: unknown,
+  profile: unknown
+) => Promise<boolean | void> | boolean | void;
 
 const extraProviders: Provider[] = [];
 const signInHooks: SignInHook[] = [];

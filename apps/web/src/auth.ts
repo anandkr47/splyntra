@@ -11,11 +11,22 @@ import { registeredAuthProviders, registeredSignInHooks } from "@/lib/auth-exten
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   ...authConfig,
-  events: {
-    async signIn({ user, account }) {
+  callbacks: {
+    ...authConfig.callbacks,
+    // Sign-in guards run BEFORE a session is issued and can DENY sign-in. The
+    // cloud build registers one that persists/links the OAuth identity (refusing
+    // unverified-email linking) and fails closed — so a user never ends up with a
+    // session but no backing user row. Open edition registers none (always true).
+    async signIn({ user, account, profile }) {
       for (const hook of registeredSignInHooks()) {
-        await hook(user as { id?: string; email?: string | null }, account);
+        try {
+          const ok = await hook(user as { id?: string; email?: string | null }, account, profile);
+          if (ok === false) return false;
+        } catch {
+          return false; // fail closed
+        }
       }
+      return true;
     },
   },
   providers: [

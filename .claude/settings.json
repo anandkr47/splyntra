@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx --yes tsx shared/pricing.test.ts)",
+      "Bash(node --experimental-strip-types shared/pricing.test.ts)"
+    ],
+    "additionalDirectories": [
+      "/Users/anandk/Projects/splyntra-cloud/frontend/cloud-screens/app/api/billing/checkout"
+    ]
+  }
+}
