@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth as getSession } from "@/auth";
 import { roleAtLeast } from "@/lib/db";
+import { resolveCollectorAuth } from "@/lib/collector-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -25,12 +26,12 @@ async function proxy(req: NextRequest, path: string[]): Promise<NextResponse> {
 
   const headers = new Headers();
   // Authenticate on the logged-in user's behalf (see api/v1 proxy for rationale).
+  const session = await getSession();
   const incoming = (req.headers.get("authorization") || "").replace(/^Bearer\s*/i, "").trim();
-  const serverKey =
-    process.env.SPLYNTRA_API_KEY ||
-    (process.env.NODE_ENV !== "production" ? "splyntra_dev_key" : "");
-  const key = incoming || serverKey;
-  if (key) headers.set("authorization", `Bearer ${key}`);
+  const auth = await resolveCollectorAuth(session, incoming);
+  for (const [k, v] of Object.entries(auth.headers)) {
+    headers.set(k, v);
+  }
   headers.set("content-type", req.headers.get("content-type") || "application/json");
 
   const init: RequestInit = { method: req.method, headers };

@@ -13,10 +13,13 @@ export const authConfig: NextAuthConfig = {
   // Auth.js v5 defaults to AUTH_SECRET; our deploy sets NEXTAUTH_SECRET. In
   // local dev (npm run dev) neither may be set, so fall back to a fixed dev
   // secret — but in production an unset secret is a hard error.
+  // The insecure dev secret activates ONLY when NODE_ENV is explicitly
+  // "development". In production (or an unset NODE_ENV) it stays undefined, so
+  // next-auth hard-fails at startup rather than silently using a known secret.
   secret:
     process.env.AUTH_SECRET ||
     process.env.NEXTAUTH_SECRET ||
-    (process.env.NODE_ENV !== "production" ? "splyntra-dev-insecure-secret" : undefined),
+    (process.env.NODE_ENV === "development" ? "splyntra-dev-insecure-secret" : undefined),
   pages: { signIn: "/login" },
   session: { strategy: "jwt" },
   providers: [], // real providers are added in auth.ts (Node runtime)

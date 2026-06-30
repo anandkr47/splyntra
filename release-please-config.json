@@ -13,6 +13,11 @@
       "release-type": "node",
       "package-name": "@splyntra/sdk",
       "changelog-path": "CHANGELOG.md"
+    },
+    "apps/web": {
+      "release-type": "node",
+      "package-name": "@splyntra/dashboard",
+      "changelog-path": "CHANGELOG.md"
     }
   },
   "plugins": [

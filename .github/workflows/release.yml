@@ -34,6 +34,7 @@ jobs:
       releases_created: ${{ steps.release.outputs.releases_created }}
       py_released: ${{ steps.release.outputs['sdks/python--release_created'] }}
       ts_released: ${{ steps.release.outputs['sdks/typescript--release_created'] }}
+      dashboard_released: ${{ steps.release.outputs['apps/web--release_created'] }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -100,6 +101,29 @@ jobs:
           npx vitest run
           npm run build
 
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ─── Dashboard (composable source) → npm (only when its release was created) ─
+  # Published as source — no build step; the cloud build composes + builds it.
+  publish-dashboard:
+    needs: release-please
+    if: needs.release-please.outputs.dashboard_released == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write            # npm provenance
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
       - name: Publish to npm
         run: npm publish --provenance --access public
         env:

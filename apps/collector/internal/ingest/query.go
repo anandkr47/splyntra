@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"github.com/splyntra/splyntra/apps/collector/extension"
 	"github.com/splyntra/splyntra/apps/collector/internal/auth"
 	"github.com/splyntra/splyntra/apps/collector/internal/store"
 )
@@ -365,6 +366,12 @@ func (q *QueryHandler) CreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Name == "" && body.Slug == "" {
 		http.Error(w, `{"error":"name or slug required"}`, http.StatusBadRequest)
+		return
+	}
+	// Plan/usage enforcement (allow-all in OSS; the commercial build enforces the
+	// plan's project limit). Returns 402 Payment Required when the cap is hit.
+	if ok, reason := extension.Quota().Allow(r.Context(), t.OrgID, "project.create"); !ok {
+		http.Error(w, `{"error":"`+jsonEscape(reason)+`"}`, http.StatusPaymentRequired)
 		return
 	}
 	p, err := q.pg.CreateProject(r.Context(), t.OrgID, body.Name, body.Slug, body.Environment)

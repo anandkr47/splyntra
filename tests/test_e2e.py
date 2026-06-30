@@ -131,6 +131,37 @@ def test_list_projects():
     print(f"✓ Projects query passed ({data['total']} projects)")
 
 
+def test_provisioning():
+    """Project create + API key issue/list/rotate/revoke round-trip (admin scope)."""
+    proj = requests.post(
+        f"{COLLECTOR_URL}/v1/projects",
+        json={"name": "E2E Provisioned", "environment": "staging"},
+        headers=HEADERS,
+    )
+    assert proj.status_code == 201, f"Project create failed: {proj.status_code} {proj.text}"
+    project_id = proj.json()["id"]
+
+    issued = requests.post(
+        f"{COLLECTOR_URL}/v1/keys",
+        json={"name": "e2e-key", "project_id": project_id, "scopes": ["ingest", "read"]},
+        headers=HEADERS,
+    )
+    assert issued.status_code == 201, f"Key issue failed: {issued.status_code} {issued.text}"
+    body = issued.json()
+    assert body["key"].startswith("splyntra_"), "plaintext key not returned"
+    key_id = body["meta"]["id"]
+
+    listed = requests.get(f"{COLLECTOR_URL}/v1/keys", headers=HEADERS)
+    assert listed.status_code == 200 and any(k["id"] == key_id for k in listed.json()["keys"])
+
+    rotated = requests.post(f"{COLLECTOR_URL}/v1/keys/{key_id}/rotate", headers=HEADERS)
+    assert rotated.status_code == 200 and rotated.json()["key"].startswith("splyntra_")
+
+    revoked = requests.delete(f"{COLLECTOR_URL}/v1/keys/{key_id}", headers=HEADERS)
+    assert revoked.status_code == 204, f"Key revoke failed: {revoked.status_code}"
+    print("✓ Provisioning (project + key issue/rotate/revoke) passed")
+
+
 def test_alerts_crud():
     """Alert create -> list -> delete round-trip."""
     create = requests.post(
@@ -205,6 +236,7 @@ def main():
         test_ingest_otlp,
         test_query_traces,
         test_list_projects,
+        test_provisioning,
         test_alerts_crud,
         test_validation_rejects_bad_event,
         test_detector_health,

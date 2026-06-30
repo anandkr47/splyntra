@@ -1,8 +1,18 @@
 {
   "name": "@splyntra/dashboard",
   "version": "0.1.0",
-  "private": true,
+  "description": "Splyntra open dashboard — the composable source the commercial cloud build overlays. Published as source (not a prebuilt library): consumers compose it with their overlays + `next build`.",
   "license": "AGPL-3.0-only",
+  "repository": { "type": "git", "url": "https://github.com/splyntra/splyntra", "directory": "apps/web" },
+  "publishConfig": { "access": "public" },
+  "files": [
+    "src",
+    "public",
+    "next.config.js",
+    "tailwind.config.js",
+    "postcss.config.js",
+    "tsconfig.json"
+  ],
   "scripts": {
     "dev": "next dev",
     "build": "next build",

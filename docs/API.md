@@ -120,6 +120,25 @@ Built-in scorers: `exact_match`, `rule_based`, `tool_call_success`, `latency`,
 the `splyntra.scorers` entry point when installed (with `EVAL_LLM_API_KEY` set).
 A run with `gate:true` fails when the score regresses below the dataset baseline.
 
+## Provisioning (admin-scoped)
+
+Create projects and manage API keys at runtime. These require a key with the
+`admin` scope (or, in the managed dashboard, an owner/admin session — the BFF
+enforces the role). A newly issued key's plaintext is returned **once** and never
+again (only its SHA-256 hash is stored).
+
+| Method | Path                       | Description |
+|--------|----------------------------|-------------|
+| POST   | `/v1/projects`             | Create a project in your org. Body: `{name, slug?, environment?}`. |
+| GET    | `/v1/keys`                 | List key metadata (prefix, scopes, status — never the secret). |
+| POST   | `/v1/keys`                 | Issue a key. Body: `{name, project_id?, scopes?}` → `{key, meta}` (`key` shown once). |
+| DELETE | `/v1/keys/{keyID}`         | Revoke a key (deactivates it; the auth cache clears within ~60s). |
+| POST   | `/v1/keys/{keyID}/rotate`  | Replace a key's secret in place → `{key}` (new plaintext, shown once). |
+
+Scopes: `ingest` (send traces), `read` (query), `admin` (provision). In the
+commercial Cloud edition the per-plan **project limit** is enforced here (a
+capped org gets `402 Payment Required`).
+
 ## Alerts
 
 | Method | Path                  | Description |

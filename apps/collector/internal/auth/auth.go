@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -44,10 +45,17 @@ func (t *TenantInfo) HasScope(scope string) bool {
 type APIKeyAuthenticator struct {
 	db    *sql.DB
 	cache sync.Map
+	// serviceToken, when set (COLLECTOR_SERVICE_TOKEN), lets a trusted first-party
+	// caller (the dashboard BFF) declare the tenant via X-Splyntra-Org-Id /
+	// X-Splyntra-Project-Id headers instead of an API key. This is how the
+	// multi-tenant Cloud edition scopes each request to the logged-in user's org
+	// (api_keys store only hashes, so the BFF can't replay a per-org key). It is
+	// a server-to-server secret and must never be exposed to the browser.
+	serviceToken string
 }
 
 func NewAPIKeyAuthenticator(dsn string) *APIKeyAuthenticator {
-	a := &APIKeyAuthenticator{}
+	a := &APIKeyAuthenticator{serviceToken: os.Getenv("COLLECTOR_SERVICE_TOKEN")}
 	if dsn != "" {
 		db, err := sql.Open("postgres", dsn)
 		if err == nil {
@@ -82,6 +90,20 @@ func (a *APIKeyAuthenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Trusted first-party service token: the caller (dashboard BFF) declares
+		// the tenant via headers. Gated on a non-empty configured secret and a
+		// constant-time match, so it never activates by accident.
+		if a.serviceToken != "" && subtle.ConstantTimeCompare([]byte(key), []byte(a.serviceToken)) == 1 {
+			tenant, ok := tenantFromHeaders(r)
+			if !ok {
+				http.Error(w, `{"error":"service token requires a valid X-Splyntra-Org-Id"}`, http.StatusBadRequest)
+				return
+			}
+			ctx := context.WithValue(r.Context(), TenantContextKey, tenant)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
 		tenant, ok := a.resolve(key)
 		if !ok {
 			http.Error(w, `{"error":"invalid api key"}`, http.StatusUnauthorized)
@@ -91,6 +113,39 @@ func (a *APIKeyAuthenticator) Middleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), TenantContextKey, tenant)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+var authUUIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// keyCacheTTL bounds how long a key-resolution result is cached. Kept short so a
+// revoked/rotated key stops working quickly (revocation flips api_keys.is_active,
+// which the next uncached lookup respects).
+const keyCacheTTL = 60 * time.Second
+
+// tenantFromHeaders builds tenant context from the trusted service-token path's
+// headers. org_id is required and must be a UUID; project/env are optional.
+func tenantFromHeaders(r *http.Request) (*TenantInfo, bool) {
+	orgID := r.Header.Get("X-Splyntra-Org-Id")
+	if !authUUIDRe.MatchString(orgID) {
+		return nil, false
+	}
+	projectID := r.Header.Get("X-Splyntra-Project-Id")
+	if projectID != "" && !authUUIDRe.MatchString(projectID) {
+		return nil, false
+	}
+	env := r.Header.Get("X-Splyntra-Env")
+	if env == "" {
+		env = "production"
+	}
+	return &TenantInfo{
+		OrgID:     orgID,
+		ProjectID: projectID,
+		Env:       env,
+		KeyID:     "svc",
+		// The BFF enforces the session role before forwarding; the collector
+		// grants the trusted channel full scopes within the declared org.
+		Scopes: []string{"ingest", "read", "admin"},
+	}, true
 }
 
 func extractAPIKey(r *http.Request) string {
@@ -109,7 +164,7 @@ func (a *APIKeyAuthenticator) resolve(key string) (*TenantInfo, bool) {
 	// Check cache first
 	if cached, ok := a.cache.Load(key); ok {
 		entry := cached.(*cacheEntry)
-		if time.Since(entry.ts) < 5*time.Minute {
+		if time.Since(entry.ts) < keyCacheTTL {
 			return entry.tenant, true
 		}
 		a.cache.Delete(key)

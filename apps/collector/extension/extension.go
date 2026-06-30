@@ -63,3 +63,25 @@ func Register(m Module) { registry = append(registry, m) }
 
 // Modules returns the registered modules in registration order.
 func Modules() []Module { return registry }
+
+// QuotaGuard authorizes a tenant action against plan limits. The open core calls
+// it at low-frequency control points (e.g. project creation); the commercial
+// build registers a guard backed by org plans + usage. The OSS default allows
+// everything (single-tenant, no plans). Keep it off hot paths — it may hit a DB.
+type QuotaGuard interface {
+	// Allow reports whether orgID may perform action (e.g. "project.create").
+	// The returned reason is surfaced to the caller when denied.
+	Allow(ctx context.Context, orgID, action string) (bool, string)
+}
+
+type allowAllGuard struct{}
+
+func (allowAllGuard) Allow(context.Context, string, string) (bool, string) { return true, "" }
+
+var guard QuotaGuard = allowAllGuard{}
+
+// RegisterQuotaGuard installs the plan/usage enforcement guard (commercial).
+func RegisterQuotaGuard(g QuotaGuard) { guard = g }
+
+// Quota returns the active guard (allow-all in OSS).
+func Quota() QuotaGuard { return guard }
