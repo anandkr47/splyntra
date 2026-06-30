@@ -3,7 +3,9 @@
     "allow": [
       "Bash(npx --yes tsx shared/pricing.test.ts)",
       "Bash(node --experimental-strip-types shared/pricing.test.ts)",
-      "Bash(grep -E \"^ [a-z].*:$\" docker-compose.yml)"
+      "Bash(grep -E \"^ [a-z].*:$\" docker-compose.yml)",
+      "Bash(grep -nA25 \"__all__\" sdks/python/src/splyntra/__init__.py)",
+      "Bash(awk '/function wrapSpan/,/^}/' index.ts)"
     ],
     "additionalDirectories": [
       "/Users/anandk/Projects/splyntra-cloud/frontend/cloud-screens/app/api/billing/checkout",

@@ -1,0 +1,25 @@
+{
+  "name": "splyntra-production-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-grade AI agent service instrumented with @splyntra/sdk — a deployable HTTP service with config validation, resilience, redaction, and graceful shutdown.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@splyntra/sdk": "^1.1.0",
+    "openai": "^4.55.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

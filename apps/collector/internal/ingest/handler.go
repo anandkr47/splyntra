@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/splyntra/splyntra/apps/collector/internal/auth"
@@ -72,7 +73,13 @@ func (h *Handler) ReceiveTraces(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	default:
-		if err := json.Unmarshal(body, &req); err != nil {
+		// OTLP/JSON must be parsed with protojson, NOT encoding/json: the OTLP
+		// wire format is camelCase (resourceSpans, traceId, startTimeUnixNano as a
+		// string), while the generated struct's encoding/json tags are snake_case.
+		// encoding/json silently drops every field (0 spans, HTTP 200) — which is
+		// exactly what the OTLP/HTTP-JSON SDK exporters send. DiscardUnknown keeps
+		// us tolerant of newer OTLP fields.
+		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &req); err != nil {
 			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 			return
 		}
