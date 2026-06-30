@@ -116,9 +116,6 @@ Five pillars on one pipeline — Observe, Evaluate, Secure, Govern, Trust.
 | [Helm chart](deploy/helm/splyntra) | Kubernetes / managed-cloud deployment |
 | [Contributing](CONTRIBUTING.md) | Local dev, Conventional Commits, automated releases |
 | [Security](SECURITY.md) | Responsible disclosure |
-
-
-
 ---
 
 ## Development
