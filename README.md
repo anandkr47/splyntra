@@ -1,8 +1,12 @@
-# Splyntra
+<p align="center">
+  <img src="https://avatars.githubusercontent.com/u/291030557?s=200" alt="Splyntra" width="80" />
+</p>
 
-**Unified observability and security for AI agents.**
+<h1 align="center">Splyntra</h1>
 
-See what your agents did and whether it was safe — in one view.
+<p align="center"><strong>Unified observability and security for AI agents.</strong></p>
+
+<p align="center">See what your agents did and whether it was safe — in one view.</p>
 
 [![Go](https://github.com/splyntra/splyntra/actions/workflows/go.yml/badge.svg)](https://github.com/splyntra/splyntra/actions/workflows/go.yml)
 [![Python](https://github.com/splyntra/splyntra/actions/workflows/python.yml/badge.svg)](https://github.com/splyntra/splyntra/actions/workflows/python.yml)

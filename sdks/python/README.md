@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://avatars.githubusercontent.com/u/291030557?s=200" alt="Splyntra" width="64" />
+</p>
+
 # Splyntra Python SDK
 
 [![PyPI](https://img.shields.io/pypi/v/splyntra)](https://pypi.org/project/splyntra/)

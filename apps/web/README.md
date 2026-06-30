@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://avatars.githubusercontent.com/u/291030557?s=200" alt="Splyntra" width="64" />
+</p>
+
 # @splyntra/dashboard
 
 [![npm](https://img.shields.io/npm/v/@splyntra/dashboard)](https://www.npmjs.com/package/@splyntra/dashboard)
