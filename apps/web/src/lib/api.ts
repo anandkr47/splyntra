@@ -52,6 +52,17 @@ export async function apiGet<T>(path: string): Promise<T> {
 export interface TraceListResponse {
   traces: TraceListItem[];
   total: number;
+  limit?: number;
+  offset?: number;
+}
+
+export interface TraceQueryOpts {
+  limit?: number;
+  offset?: number;
+  agentId?: string;
+  status?: string; // "ok" | "error"
+  severity?: string; // "low" | "medium" | "high" | "critical"
+  since?: number; // seconds
 }
 
 export interface TraceListItem {
@@ -72,6 +83,22 @@ export interface TraceListItem {
 
 export interface TraceDetailResponse {
   trace_id: string;
+  // Authoritative stored trace row (risk/agent/status/timing) — present when the
+  // trace exists; the detail view prefers this over recomputing from spans.
+  trace?: {
+    agent_id: string;
+    workflow_id: string;
+    status: string;
+    latency_ms: number;
+    total_tokens: number;
+    cost_usd: number;
+    risk_score: number;
+    risk_severity: string;
+    detection_count: number;
+    span_count: number;
+    started_at: string;
+    completed_at: string;
+  };
   spans: SpanItem[];
   detections: DetectionItem[];
 }
@@ -106,12 +133,43 @@ export interface DetectionItem {
   detected_at: string;
 }
 
-export async function fetchTraces(limit = 50): Promise<TraceListResponse> {
-  return apiGet<TraceListResponse>(withProject(`/v1/traces?limit=${limit}`));
+export async function fetchTraces(opts: TraceQueryOpts = {}): Promise<TraceListResponse> {
+  const p = new URLSearchParams();
+  p.set("limit", String(opts.limit ?? 50));
+  if (opts.offset) p.set("offset", String(opts.offset));
+  if (opts.agentId) p.set("agent_id", opts.agentId);
+  if (opts.status) p.set("status", opts.status);
+  if (opts.severity) p.set("severity", opts.severity);
+  if (opts.since) p.set("since", String(opts.since));
+  return apiGet<TraceListResponse>(withProject(`/v1/traces?${p.toString()}`));
 }
 
 export async function fetchTrace(traceId: string): Promise<TraceDetailResponse> {
   return apiGet<TraceDetailResponse>(withProject(`/v1/traces/${encodeURIComponent(traceId)}`));
+}
+
+// ─── Security incidents feed ─────────────────────────────────────────────────
+export interface IncidentQueryOpts {
+  limit?: number;
+  offset?: number;
+  detector?: string; // "pii" | "secrets" | "injection"
+  severity?: string; // "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" (floor)
+  since?: number; // seconds
+}
+export interface IncidentListResponse {
+  incidents: DetectionItem[];
+  total: number;
+  limit?: number;
+  offset?: number;
+}
+export async function fetchIncidents(opts: IncidentQueryOpts = {}): Promise<IncidentListResponse> {
+  const p = new URLSearchParams();
+  p.set("limit", String(opts.limit ?? 50));
+  if (opts.offset) p.set("offset", String(opts.offset));
+  if (opts.detector) p.set("detector", opts.detector);
+  if (opts.severity) p.set("severity", opts.severity);
+  if (opts.since) p.set("since", String(opts.since));
+  return apiGet<IncidentListResponse>(withProject(`/v1/security/incidents?${p.toString()}`));
 }
 
 function getApiKey(): string {
@@ -134,6 +192,7 @@ export interface AgentItem {
   total_tokens: number;
   total_cost: number;
   detection_count: number;
+  avg_risk: number;
   last_seen_at: string;
 }
 
@@ -142,8 +201,9 @@ export interface AgentsResponse {
   total: number;
 }
 
-export async function fetchAgents(): Promise<AgentsResponse> {
-  return apiGet<AgentsResponse>(withProject(`/v1/agents`));
+export async function fetchAgents(windowSec?: number): Promise<AgentsResponse> {
+  const q = windowSec ? `?window=${windowSec}` : "";
+  return apiGet<AgentsResponse>(withProject(`/v1/agents${q}`));
 }
 
 // ─── Costs API ──────────────────────────────────────────────────────────────
@@ -171,14 +231,64 @@ export interface ProjectCostItem {
   total_cost: number;
 }
 
+export interface WorkflowCostItem {
+  workflow_id: string;
+  call_count: number;
+  total_tokens: number;
+  total_cost: number;
+}
 export interface CostsResponse {
   models: CostModelItem[];
   summary: CostSummary;
   by_project: ProjectCostItem[];
+  by_workflow: WorkflowCostItem[];
 }
 
 export async function fetchCosts(): Promise<CostsResponse> {
   return apiGet<CostsResponse>(withProject(`/v1/costs`));
+}
+
+// ─── Model pricing (admin) ───────────────────────────────────────────────────
+export interface ModelPriceRow {
+  model: string;
+  prompt_per_1k: number;
+  completion_per_1k: number;
+  updated_at: string;
+}
+export interface PricingResponse {
+  prices: ModelPriceRow[];
+  unpriced: string[] | null;
+}
+export async function fetchPricing(): Promise<PricingResponse> {
+  return apiGet<PricingResponse>(`/v1/pricing`);
+}
+export async function upsertPricing(input: { model: string; prompt_per_1k: number; completion_per_1k: number }): Promise<void> {
+  await apiSend(`/v1/pricing`, "PUT", input);
+}
+export async function deletePricing(model: string): Promise<void> {
+  await apiSend(`/v1/pricing/${encodeURIComponent(model)}`, "DELETE");
+}
+
+// ─── Budgets ─────────────────────────────────────────────────────────────────
+export interface BudgetView {
+  id: string;
+  project_id: string;
+  monthly_limit_usd: number;
+  spent_usd: number;
+  forecast_usd: number;
+  pct_used: number;
+}
+export interface BudgetsResponse {
+  budgets: BudgetView[];
+}
+export async function fetchBudgets(): Promise<BudgetsResponse> {
+  return apiGet<BudgetsResponse>(`/v1/budgets`);
+}
+export async function upsertBudget(input: { project_id?: string; monthly_limit_usd: number }): Promise<void> {
+  await apiSend(`/v1/budgets`, "PUT", input);
+}
+export async function deleteBudget(id: string): Promise<void> {
+  await apiSend(`/v1/budgets/${encodeURIComponent(id)}`, "DELETE");
 }
 
 // ─── Evaluation API (separate service, proxied via /api/eval) ───────────────
@@ -223,6 +333,22 @@ export async function fetchEvalRuns(datasetId?: string): Promise<{ runs: EvalRun
   return evalGet(`/v1/evaluations${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`);
 }
 
+export interface EvalResultItem {
+  idx: number;
+  input: string;
+  expected: string;
+  actual: string;
+  passed: boolean;
+  scores: Record<string, number>;
+}
+export interface EvalRunDetail {
+  run: EvalRun;
+  items: EvalResultItem[];
+}
+export async function fetchEvalRun(runId: string): Promise<EvalRunDetail> {
+  return evalGet(`/v1/evaluations/${encodeURIComponent(runId)}`);
+}
+
 export async function apiSend(path: string, method: string, body?: unknown): Promise<any> {
   const res = await fetch(`${API_BASE}${path}`, {
     method,
@@ -240,7 +366,9 @@ export interface MetricPoint {
   trace_count: number;
   error_count: number;
   avg_latency_ms: number;
+  p50_latency_ms: number;
   p95_latency_ms: number;
+  p99_latency_ms: number;
   total_tokens: number;
   total_cost: number;
 }
@@ -251,8 +379,21 @@ export interface MetricsResponse {
   interval: number;
 }
 
-export async function fetchMetrics(windowSec = 86400, intervalSec = 300): Promise<MetricsResponse> {
-  return apiGet<MetricsResponse>(withProject(`/v1/metrics?window=${windowSec}&interval=${intervalSec}`));
+export interface MetricsQueryOpts {
+  windowSec?: number;
+  intervalSec?: number;
+  offsetSec?: number; // shift window back (period-over-period comparison)
+  agentId?: string;
+  model?: string;
+}
+export async function fetchMetrics(opts: MetricsQueryOpts = {}): Promise<MetricsResponse> {
+  const p = new URLSearchParams();
+  p.set("window", String(opts.windowSec ?? 86400));
+  p.set("interval", String(opts.intervalSec ?? 300));
+  if (opts.offsetSec) p.set("offset", String(opts.offsetSec));
+  if (opts.agentId) p.set("agent_id", opts.agentId);
+  if (opts.model) p.set("model", opts.model);
+  return apiGet<MetricsResponse>(withProject(`/v1/metrics?${p.toString()}`));
 }
 
 // ─── Projects API ─────────────────────────────────────────────────────────
@@ -263,6 +404,7 @@ export interface ProjectItem {
   slug: string;
   environment: string;
   created_at: string;
+  archived_at: string | null;
 }
 
 export interface ProjectsResponse {
@@ -280,6 +422,19 @@ export async function createProject(input: {
   environment?: string;
 }): Promise<ProjectItem> {
   return apiSend(`/v1/projects`, "POST", input);
+}
+
+// Rename and/or archive a project (both fields optional).
+export async function updateProject(
+  id: string,
+  patch: { name?: string; archived?: boolean }
+): Promise<void> {
+  await apiSend(`/v1/projects/${encodeURIComponent(id)}`, "PATCH", patch);
+}
+
+// Hard-delete a project and purge its trace data. Irreversible.
+export async function deleteProject(id: string): Promise<void> {
+  await apiSend(`/v1/projects/${encodeURIComponent(id)}`, "DELETE");
 }
 
 // ─── API keys (provisioning; requires an admin-scoped key) ───────────────────
@@ -368,6 +523,35 @@ export async function createAlert(input: CreateAlertInput): Promise<{ id: string
   });
   if (!res.ok) throw new Error(`Failed to create alert: ${res.status}`);
   return res.json();
+}
+
+export interface UpdateAlertInput {
+  name?: string;
+  type?: string; // sent to bound config validation server-side; not persisted
+  config?: Record<string, unknown>;
+  channels?: string[];
+  is_active?: boolean;
+}
+
+export async function updateAlert(alertId: string, patch: UpdateAlertInput): Promise<void> {
+  const res = await fetch(`${API_BASE}/v1/alerts/${encodeURIComponent(alertId)}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${getApiKey()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok && res.status !== 204) {
+    let msg = `Failed to update alert: ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.error) msg = body.error;
+    } catch {
+      /* keep default */
+    }
+    throw new Error(msg);
+  }
 }
 
 export async function deleteAlert(alertId: string): Promise<void> {

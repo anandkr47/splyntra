@@ -80,3 +80,49 @@ def test_pii_detects_email_if_available():
     # Detector normalizes entity types to lowercase (the contract the collector +
     # ClickHouse rely on, e.g. stored category "email_address").
     assert any(d.category == "email_address" for d in dets)
+
+
+# ─── India PII (Aadhaar + PAN) — regex + Verhoeff, still needs Presidio import ─
+
+def _pii_or_skip():
+    try:
+        from detectors.pii import PIIDetector
+        return PIIDetector()
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"Presidio analyzer unavailable: {e}")
+
+
+def _valid_aadhaar() -> str:
+    """Build a Verhoeff-valid 12-digit Aadhaar (starts 2-9) for the positive test."""
+    from detectors.pii import _verhoeff_valid
+
+    base = "23412341234"  # 11 digits
+    for d in "0123456789":
+        if _verhoeff_valid(base + d):
+            return base + d
+    raise AssertionError("no valid Verhoeff check digit found")
+
+
+def test_pii_detects_valid_aadhaar():
+    detector = _pii_or_skip()
+    dets = detector.scan(f"User Aadhaar is {_valid_aadhaar()} on file.")
+    aadhaar = [d for d in dets if d.category == "aadhaar"]
+    assert aadhaar, "expected an aadhaar detection"
+    assert aadhaar[0].severity == "CRITICAL"
+    assert aadhaar[0].redacted == "[REDACTED:AADHAAR]"
+
+
+def test_pii_ignores_aadhaar_with_bad_checksum():
+    detector = _pii_or_skip()
+    # A 12-digit number starting 2-9 that fails the Verhoeff check must NOT flag.
+    dets = detector.scan("Order reference 234123412340 shipped.")
+    assert not any(d.category == "aadhaar" for d in dets)
+
+
+def test_pii_detects_indian_pan():
+    detector = _pii_or_skip()
+    dets = detector.scan("PAN: ABCPE1234F for the vendor.")
+    pan = [d for d in dets if d.category == "indian_pan"]
+    assert pan, "expected an indian_pan detection"
+    assert pan[0].severity == "HIGH"
+    assert pan[0].redacted == "[REDACTED:INDIAN_PAN]"

@@ -11,9 +11,12 @@ from pydantic import BaseModel, Field
 
 from . import storage
 from .auth import Tenant, require_tenant
+from scorers import SCORERS, PLUGIN_SCORERS
 from scorers.engine import score_items, is_regression
 
 router = APIRouter()
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 def _slug(name: str) -> str:
@@ -113,16 +116,57 @@ def _dataset_owned(cur, dataset_id: str, tenant: Tenant):
         raise HTTPException(status_code=404, detail="dataset not found")
 
 
+def _load_ground_truth(cur, dataset_id: str) -> dict:
+    """Map input -> dataset item from the latest dataset version's stored JSONL,
+    so scoring uses the server-owned expected outputs. Empty if absent."""
+    cur.execute(
+        "SELECT object_key FROM eval_dataset_versions WHERE dataset_id = %s ORDER BY version DESC LIMIT 1",
+        (dataset_id,),
+    )
+    row = cur.fetchone()
+    if not row or not row.get("object_key"):
+        return {}
+    try:
+        ds_items = storage.get_items(row["object_key"])
+    except Exception:  # noqa: BLE001 — missing object shouldn't fail the run
+        return {}
+    return {it.get("input", ""): it for it in ds_items if it.get("input")}
+
+
 @router.post("/v1/evaluations/run")
 def run_evaluation(body: RunRequest, tenant: Tenant = Depends(require_tenant)):
     if not body.results:
         raise HTTPException(status_code=400, detail="no results to score")
 
+    # Reject unknown scorer names up front. Otherwise the engine silently drops
+    # them and a CI gate can "pass" on a typo'd scorer — a dangerous false green.
+    known = set(SCORERS) | set(PLUGIN_SCORERS)
+    unknown = [s for s in body.scorers if s not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown scorer(s): {', '.join(unknown)}. Available: {', '.join(sorted(known))}",
+        )
+
     items = [r.model_dump() for r in body.results]
+
+    # Join the dataset's server-owned ground truth to the submitted results by
+    # input, so scores reflect the dataset's expected outputs rather than the
+    # caller-supplied `expected` (which the client controls and could spoof).
+    with storage.cursor() as cur:
+        _dataset_owned(cur, body.dataset_id, tenant)
+        ground_truth = _load_ground_truth(cur, body.dataset_id)
+    matched = 0
+    for it in items:
+        g = ground_truth.get(it.get("input", ""))
+        if g:
+            it["expected"] = g.get("expected_output", it.get("expected", ""))
+            it["expected_tool_calls"] = g.get("expected_tool_calls", it.get("expected_tool_calls", []))
+            matched += 1
+
     scored = score_items(items, body.scorers)
 
     with storage.cursor() as cur:
-        _dataset_owned(cur, body.dataset_id, tenant)
         cur.execute("SELECT score FROM eval_baselines WHERE dataset_id = %s", (body.dataset_id,))
         row = cur.fetchone()
         baseline = row["score"] if row else None
@@ -163,7 +207,33 @@ def run_evaluation(body: RunRequest, tenant: Tenant = Depends(require_tenant)):
         "baseline": baseline,
         "regression": regression,
         "passed": passed,
+        "matched_dataset_items": matched,
+        "item_count": len(items),
     }
+
+
+@router.get("/v1/evaluations/{run_id}")
+def get_run(run_id: str, tenant: Tenant = Depends(require_tenant)):
+    """Return a run plus its per-item results (already persisted at run time)."""
+    if not _UUID_RE.match(run_id):
+        raise HTTPException(status_code=404, detail="run not found")
+    with storage.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text, dataset_id::text, score, item_count, passed, regression, per_scorer, created_at
+            FROM eval_runs WHERE id = %s AND org_id = %s AND project_id = %s
+            """,
+            (run_id, tenant.org_id, tenant.project_id),
+        )
+        run = cur.fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="run not found")
+        cur.execute(
+            "SELECT idx, input, expected, actual, passed, scores FROM eval_results WHERE run_id = %s ORDER BY idx ASC",
+            (run_id,),
+        )
+        items = cur.fetchall()
+    return {"run": run, "items": items}
 
 
 @router.get("/v1/evaluations")

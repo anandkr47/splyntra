@@ -47,19 +47,22 @@ function apiToTrace(traceId: string, data: TraceDetailResponse): Trace {
   const maxSeverity = getMaxSeverity(detections);
   const riskScore = computeRiskScore(detections);
 
+  // Prefer the stored trace row (authoritative — matches the list view) and fall
+  // back to span-derived values only when it isn't present.
+  const t = data.trace;
   return {
     traceId,
-    agentId: spans[0]?.name || "unknown",
-    status: spans.some((s) => s.status === "error") ? "error" : "ok",
-    latencyMs: totalLatency,
-    totalTokens,
-    costUsd: totalCost,
-    riskScore,
-    riskSeverity: maxSeverity,
+    agentId: t?.agent_id || spans[0]?.name || "unknown",
+    status: (t?.status as Trace["status"]) || (spans.some((s) => s.status === "error") ? "error" : "ok"),
+    latencyMs: t?.latency_ms ?? totalLatency,
+    totalTokens: t?.total_tokens ?? totalTokens,
+    costUsd: t?.cost_usd ?? totalCost,
+    riskScore: t?.risk_score ?? riskScore,
+    riskSeverity: (t?.risk_severity as Trace["riskSeverity"]) || maxSeverity,
     detections,
     spans,
-    startedAt: spans[0]?.startedAt || new Date().toISOString(),
-    completedAt: new Date().toISOString(),
+    startedAt: t?.started_at || spans[0]?.startedAt || new Date().toISOString(),
+    completedAt: t?.completed_at || spans[0]?.startedAt || new Date().toISOString(),
     orgId: "",
     projectId: "",
     environment: "",

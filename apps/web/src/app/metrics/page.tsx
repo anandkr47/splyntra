@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   ResponsiveContainer,
   LineChart,
   Line,
   AreaChart,
   Area,
-  BarChart,
+  ComposedChart,
   Bar,
   XAxis,
   YAxis,
   Tooltip,
   CartesianGrid,
+  Legend,
 } from "recharts";
-import { LineChart as LineChartIcon, Clock, Activity, AlertTriangle, Coins } from "lucide-react";
-import { useMetrics } from "@/lib/hooks";
+import { LineChart as LineChartIcon, Activity, AlertTriangle, Coins, DollarSign } from "lucide-react";
+import { useMetrics, useAgents, useCosts } from "@/lib/hooks";
 import { MetricPoint } from "@/lib/api";
 import { PageHeader, Card, StatCard } from "@/components/ui/primitives";
+import { Select } from "@/components/ui/Select";
 
 const WINDOWS: { label: string; window: number; interval: number }[] = [
   { label: "1h", window: 3600, interval: 60 },
@@ -26,19 +28,40 @@ const WINDOWS: { label: string; window: number; interval: number }[] = [
   { label: "7d", window: 604800, interval: 3600 },
 ];
 
+
+function fmtBucket(iso: string, windowSec: number): string {
+  const d = new Date(iso);
+  return windowSec >= 2 * 86400
+    ? d.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 export default function MetricsPage() {
   const [w, setW] = useState(WINDOWS[1]);
-  const { data, isLoading, error } = useMetrics(w.window, w.interval);
+  const [agentId, setAgentId] = useState("");
+  const [model, setModel] = useState("");
+  const [compare, setCompare] = useState(false);
+
+  const base = { windowSec: w.window, intervalSec: w.interval, agentId: agentId || undefined, model: model || undefined };
+  const { data, isLoading, error } = useMetrics(base);
+  const { data: prevData } = useMetrics({ ...base, offsetSec: w.window }, compare);
+  const { data: agentsData } = useAgents();
+  const { data: costsData } = useCosts();
 
   const points: MetricPoint[] = data?.points || [];
-  const rows = points.map((p) => ({
-    t: new Date(p.bucket).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+  const prev: MetricPoint[] = prevData?.points || [];
+
+  const rows = points.map((p, i) => ({
+    t: fmtBucket(p.bucket, w.window),
     avg: Math.round(p.avg_latency_ms),
+    p50: Math.round(p.p50_latency_ms),
     p95: Math.round(p.p95_latency_ms),
+    p99: Math.round(p.p99_latency_ms),
     throughput: p.trace_count,
     errorRate: p.trace_count > 0 ? +((p.error_count / p.trace_count) * 100).toFixed(1) : 0,
-    tokens: p.total_tokens,
     cost: +p.total_cost.toFixed(4),
+    prevAvg: compare ? (prev[i] ? Math.round(prev[i].avg_latency_ms) : null) : undefined,
+    prevThroughput: compare ? (prev[i]?.trace_count ?? null) : undefined,
   }));
 
   const totals = points.reduce(
@@ -51,6 +74,9 @@ export default function MetricsPage() {
     { traces: 0, errors: 0, tokens: 0, cost: 0 }
   );
   const errorRate = totals.traces > 0 ? ((totals.errors / totals.traces) * 100).toFixed(1) : "0.0";
+
+  const agents = useMemo(() => agentsData?.agents || [], [agentsData]);
+  const models = useMemo(() => costsData?.models || [], [costsData]);
 
   return (
     <div className="mx-auto max-w-6xl p-6">
@@ -66,7 +92,7 @@ export default function MetricsPage() {
                 onClick={() => setW(opt)}
                 className={`rounded-md px-2.5 py-1 text-xs font-medium ${
                   w.label === opt.label
-                    ? "bg-splyntra-600 text-white"
+                    ? "bg-gray-900 text-white dark:bg-white dark:text-gray-900"
                     : "text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
                 }`}
               >
@@ -77,15 +103,37 @@ export default function MetricsPage() {
         }
       />
 
-      {error && !isLoading && (
-        <p className="-mt-2 mb-4 text-xs text-red-500">Could not reach the collector.</p>
-      )}
+      {/* Slice + compare controls */}
+      <div className="mb-5 flex flex-wrap items-center gap-2">
+        <Select
+          value={agentId}
+          onValueChange={setAgentId}
+          size="sm"
+          ariaLabel="Filter by agent"
+          className="min-w-[150px]"
+          options={[{ value: "", label: "All agents" }, ...agents.map((a) => ({ value: a.agent_id, label: a.name || a.agent_id }))]}
+        />
+        <Select
+          value={model}
+          onValueChange={setModel}
+          size="sm"
+          ariaLabel="Filter by model"
+          className="min-w-[150px]"
+          options={[{ value: "", label: "All models" }, ...models.map((m) => ({ value: m.model, label: m.model }))]}
+        />
+        <label className="ml-auto inline-flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-400">
+          <input type="checkbox" checked={compare} onChange={(e) => setCompare(e.target.checked)} className="accent-gray-900 dark:accent-white" />
+          Compare to previous period
+        </label>
+      </div>
+
+      {error && !isLoading && <p className="-mt-2 mb-4 text-xs text-red-500">Could not reach the collector.</p>}
 
       <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-4">
         <StatCard label="Total Runs" value={totals.traces.toLocaleString()} icon={Activity} />
         <StatCard label="Error Rate" value={`${errorRate}%`} icon={AlertTriangle} accent={totals.errors > 0 ? "text-red-600" : undefined} />
         <StatCard label="Tokens" value={totals.tokens.toLocaleString()} icon={Coins} />
-        <StatCard label="Spend" value={`$${totals.cost.toFixed(2)}`} icon={Clock} />
+        <StatCard label="Spend" value={`$${totals.cost.toFixed(2)}`} icon={DollarSign} />
       </div>
 
       {isLoading ? (
@@ -97,15 +145,21 @@ export default function MetricsPage() {
           <ChartCard title="Latency (ms)">
             <LineChart data={rows}>
               {grid()}
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Line type="monotone" dataKey="p50" name="p50" stroke="#868e96" dot={false} strokeWidth={1.5} />
               <Line type="monotone" dataKey="avg" name="avg" stroke="#4c6ef5" dot={false} strokeWidth={2} />
               <Line type="monotone" dataKey="p95" name="p95" stroke="#f59f00" dot={false} strokeWidth={2} />
+              <Line type="monotone" dataKey="p99" name="p99" stroke="#e8590c" dot={false} strokeWidth={1.5} />
+              {compare && <Line type="monotone" dataKey="prevAvg" name="avg (prev)" stroke="#adb5bd" dot={false} strokeWidth={1.5} strokeDasharray="4 3" />}
             </LineChart>
           </ChartCard>
           <ChartCard title="Throughput (runs)">
-            <BarChart data={rows}>
+            <ComposedChart data={rows}>
               {grid()}
+              {compare && <Legend wrapperStyle={{ fontSize: 11 }} />}
               <Bar dataKey="throughput" name="runs" fill="#4c6ef5" radius={[2, 2, 0, 0]} />
-            </BarChart>
+              {compare && <Line type="monotone" dataKey="prevThroughput" name="runs (prev)" stroke="#adb5bd" dot={false} strokeWidth={1.5} strokeDasharray="4 3" />}
+            </ComposedChart>
           </ChartCard>
           <ChartCard title="Error rate (%)">
             <AreaChart data={rows}>
@@ -129,7 +183,7 @@ function grid() {
   return (
     <>
       <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-      <XAxis dataKey="t" tick={{ fontSize: 11 }} stroke="#9ca3af" />
+      <XAxis dataKey="t" tick={{ fontSize: 11 }} stroke="#9ca3af" minTickGap={24} />
       <YAxis tick={{ fontSize: 11 }} stroke="#9ca3af" width={40} />
       <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
     </>

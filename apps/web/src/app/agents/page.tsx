@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 "use client";
 
+import { useState } from "react";
+import Link from "next/link";
 import { useAgents } from "@/lib/hooks";
 import { AgentItem } from "@/lib/api";
 import { Bot, CheckCircle2, AlertCircle, ShieldAlert } from "lucide-react";
 import { PageHeader, StatCard, Card, EmptyState } from "@/components/ui/primitives";
+import { Select } from "@/components/ui/Select";
+
+const WINDOWS = [
+  { label: "All time", value: 0 },
+  { label: "Last 24h", value: 86400 },
+  { label: "Last 7d", value: 604800 },
+  { label: "Last 30d", value: 2592000 },
+];
 
 export default function AgentsPage() {
-  const { data, isLoading, error } = useAgents();
+  const [windowSec, setWindowSec] = useState(0);
+  const { data, isLoading, error } = useAgents(windowSec || undefined);
 
   const agents: AgentItem[] = data?.agents || [];
   const hasRealData = !error && agents.length > 0;
@@ -19,7 +30,7 @@ export default function AgentsPage() {
   }).length;
   const errorAgents = agents.filter((a) => a.error_count > 0).length;
   const avgRisk = totalAgents > 0
-    ? Math.round(agents.reduce((sum, a) => sum + (a.detection_count > 0 ? 50 : 0), 0) / totalAgents)
+    ? Math.round(agents.reduce((sum, a) => sum + (a.avg_risk || 0), 0) / totalAgents)
     : 0;
 
   return (
@@ -28,6 +39,15 @@ export default function AgentsPage() {
         icon={Bot}
         title="Agents"
         subtitle="Monitor registered agents across environments"
+        action={
+          <Select
+            value={String(windowSec)}
+            onValueChange={(v) => setWindowSec(Number(v))}
+            ariaLabel="Time window"
+            className="min-w-[150px]"
+            options={WINDOWS.map((w) => ({ value: String(w.value), label: w.label }))}
+          />
+        }
       />
       {!hasRealData && !isLoading && (
         <p className="-mt-2 mb-4 text-xs text-amber-600">
@@ -63,6 +83,7 @@ export default function AgentsPage() {
                 <th className="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">P95 Latency</th>
                 <th className="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">Cost</th>
                 <th className="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">Detections</th>
+                <th className="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">Avg Risk</th>
                 <th className="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-wider text-gray-500">Last Seen</th>
               </tr>
             </thead>
@@ -77,7 +98,12 @@ export default function AgentsPage() {
                 return (
                   <tr key={agent.agent_id} className="hover:bg-gray-50 dark:hover:bg-gray-800">
                     <td className="px-4 py-3 font-medium">
-                      {agent.name || agent.agent_id}
+                      <Link
+                        href={`/agents/${encodeURIComponent(agent.agent_id)}`}
+                        className="text-gray-900 hover:text-splyntra-600 hover:underline dark:text-white dark:hover:text-splyntra-400"
+                      >
+                        {agent.name || agent.agent_id}
+                      </Link>
                       {agent.framework && (
                         <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] font-medium bg-splyntra-50 text-splyntra-700">
                           {agent.framework}
@@ -112,6 +138,17 @@ export default function AgentsPage() {
                       ) : (
                         <span className="text-gray-400">0</span>
                       )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {(() => {
+                        const r = Math.round(agent.avg_risk || 0);
+                        const cls = r >= 60
+                          ? "bg-red-100 text-red-700 dark:bg-red-950/30 dark:text-red-400"
+                          : r >= 30
+                            ? "bg-amber-100 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                            : "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400";
+                        return <span className={`rounded px-2 py-0.5 text-xs font-medium tabular-nums ${cls}`}>{r}</span>;
+                      })()}
                     </td>
                     <td className="px-4 py-3 text-right text-xs text-gray-500">
                       {formatRelativeTime(agent.last_seen_at)}

@@ -6,6 +6,8 @@ import { useState } from "react";
 import { SessionProvider } from "next-auth/react";
 import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { ProjectProvider } from "@/lib/project-context";
+import { ToastProvider } from "@/components/ui/Toast";
+import { ConfirmProvider } from "@/components/ui/ConfirmDialog";
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
@@ -25,7 +27,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
     <ErrorBoundary>
       <SessionProvider>
         <QueryClientProvider client={queryClient}>
-          <ProjectProvider>{children}</ProjectProvider>
+          <ToastProvider>
+            <ConfirmProvider>
+              <ProjectProvider>{children}</ProjectProvider>
+            </ConfirmProvider>
+          </ToastProvider>
         </QueryClientProvider>
       </SessionProvider>
     </ErrorBoundary>

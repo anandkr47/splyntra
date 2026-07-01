@@ -67,7 +67,8 @@ Response: `{"accepted": N, "spans": M, "timestamp": "..."}`.
 | GET    | `/v1/traces?limit=N`    | Recent traces (risk score, latency, cost, tokens). |
 | GET    | `/v1/traces/{traceID}`  | One trace: `{spans, detections}`. |
 | GET    | `/v1/agents`            | Aggregated agent stats + framework metadata. |
-| GET    | `/v1/costs`             | `{models, summary, by_project}` cost breakdown. |
+| GET    | `/v1/costs`             | `{models, summary, by_project, by_workflow}` cost breakdown. |
+| GET    | `/v1/security/incidents?detector=&severity=&since=&limit=&offset=` | Org/project-wide detection feed → `{incidents, total, limit, offset}`. `severity` is a floor (`low`\|`medium`\|`high`\|`critical`). |
 | GET    | `/v1/metrics?window=&interval=` | Time-series: latency p50/p95, throughput, error/success rate, tokens, cost. |
 | GET    | `/v1/projects`          | Projects in your org. |
 
@@ -101,6 +102,43 @@ redact→validate→store→detect path.
 | POST | `/v1/authorize` | Decision API → `{"decision":"allow"|"deny"|"needs_approval"}`. Checks permissions, daily spend, policies, and approval rules. |
 
 `authorize` body: `{"agent_id":"support_agent","action":"payments.refund","resource":"payments","context":{"amount":80}}`.
+
+## Agent Identity (commercial · Enterprise)
+
+> Not in the open collector (returns `404` on the open build). Provided by
+> `collector-cloud`, mounted on `/v1` under the `agent_identity` feature.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET/POST | `/v1/identity/agents` | List / register agents (name, type, owner, environment). |
+| GET/PATCH/DELETE | `/v1/identity/agents/{id}` | Read / update / remove an agent. |
+| POST | `/v1/identity/agents/{id}/credentials` | Issue or rotate a credential → plaintext returned **once** (stored hashed). |
+| DELETE | `/v1/identity/credentials/{credID}` | Revoke a credential. |
+| GET/POST | `/v1/identity/trust` · DELETE `/v1/identity/trust/{policyID}` | Agent-to-agent trust policies (JSONB, deny-wins). |
+| POST | `/v1/identity/authorize` | Trust decision for an agent pair → `{"decision":"allow"\|"deny"}`. |
+
+## Enterprise SSO — SAML & SCIM (commercial · Enterprise)
+
+> Provided by the cloud **dashboard** (the `splyntra-cloud` `cloud-screens`
+> overlay), gated by the `sso` feature flag. These are Next.js routes on the web
+> app, not the collector. Admin-configured under **Settings → SSO & SCIM**.
+
+**SAML 2.0** (per-org, `@node-saml/node-saml`):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET  | `/api/auth/saml/{org}` | SP-initiated login: redirects to the IdP (signed AuthnRequest). |
+| POST | `/api/auth/saml/{org}` | ACS: consumes the IdP `SAMLResponse`, verifies the signature/conditions, provisions the user + membership, issues the session. Fails closed on any invalid assertion. |
+
+**SCIM 2.0** (RFC 7644, per-org **Bearer token** — hashed, generated in the UI):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/scim/v2/Users` | Provision a user + org membership (idempotent on email). |
+| GET  | `/api/scim/v2/Users?filter=userName eq "…"` | List / look up org members. |
+| GET/PATCH/DELETE | `/api/scim/v2/Users/{id}` | Read / activate-deactivate (toggles membership) / deprovision. |
+
+A missing or wrong Bearer token returns `401`.
 
 ## Evaluation service (port 8002)
 
@@ -158,6 +196,11 @@ Create body:
 When a trace's risk score crosses a configured `risk_threshold`, the collector
 records an alert event and dispatches to the configured channels. Webhook/Slack
 destinations come from `ALERT_WEBHOOK_URL` / `ALERT_SLACK_WEBHOOK_URL`.
+
+Alert `type`s: `risk_threshold` (`{threshold}`), `budget` (`{limit_usd, period}`),
+and `spend_anomaly` (`{window_days, factor}`) — the latter fires when a day's
+spend exceeds the trailing `window_days` mean × `factor` (evaluated on the cost
+ticker, at most once per day). All ship in the **open** collector.
 
 ## Collector configuration (env)
 

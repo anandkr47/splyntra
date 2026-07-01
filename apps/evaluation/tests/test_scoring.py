@@ -6,7 +6,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scorers import exact_match, rule_based, tool_call_success, latency, cost  # noqa: E402
+from scorers import (  # noqa: E402
+    exact_match,
+    rule_based,
+    tool_call_success,
+    tool_call_precision,
+    precision_token_overlap,
+    recall_token_overlap,
+    latency,
+    cost,
+)
 from scorers.engine import score_items, is_regression  # noqa: E402
 
 
@@ -32,6 +41,25 @@ def test_latency_and_cost_thresholds():
     assert latency({"latency_ms": 10_000_000}) == 0.0
     assert cost({"cost_usd": 0.001}) == 1.0
     assert cost({"cost_usd": 100}) == 0.0
+
+
+def test_precision_recall_token_overlap():
+    # expected "the quick brown fox" (4 tokens); actual "quick brown" (2 tokens, both in expected)
+    item = {"expected": "the quick brown fox", "actual": "quick brown"}
+    assert precision_token_overlap(item) == 1.0          # 2/2 actual tokens are expected
+    assert recall_token_overlap(item) == 0.5             # 2/4 expected tokens present
+    # partial precision: one of two actual tokens is expected
+    p = {"expected": "alpha", "actual": "alpha zzz"}
+    assert precision_token_overlap(p) == 0.5
+    # empty edge cases → 1.0
+    assert precision_token_overlap({"expected": "x", "actual": ""}) == 1.0
+    assert recall_token_overlap({"expected": "", "actual": "x"}) == 1.0
+
+
+def test_tool_call_precision():
+    assert tool_call_precision({"expected_tool_calls": ["a", "b"], "tool_calls": ["a"]}) == 1.0   # all actual expected
+    assert tool_call_precision({"expected_tool_calls": ["a"], "tool_calls": ["a", "b"]}) == 0.5   # b unexpected
+    assert tool_call_precision({"expected_tool_calls": ["a"], "tool_calls": []}) == 1.0           # no calls → precise
 
 
 def test_score_items_aggregate():

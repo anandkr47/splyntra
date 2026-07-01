@@ -77,6 +77,29 @@ func Run() {
 		defer pgStore.Close()
 	}
 
+	// Load the model price table from Postgres and refresh it periodically, so
+	// pricing edits (via the admin API) take effect without a collector redeploy.
+	// An empty/failed load keeps the built-in defaults.
+	if pgStore != nil {
+		loadPrices := func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if prices, err := pgStore.LoadModelPrices(ctx); err != nil {
+				logger.Warn("load model prices failed; keeping last-known/built-in table", zap.Error(err))
+			} else {
+				store.SetModelPrices(prices)
+			}
+		}
+		loadPrices()
+		priceTicker := time.NewTicker(10 * time.Minute)
+		defer priceTicker.Stop()
+		go func() {
+			for range priceTicker.C {
+				loadPrices()
+			}
+		}()
+	}
+
 	// Alert engine: evaluates scored traces (risk) + periodic spend (cost).
 	alertEngine := alerts.New(pgStore, chStore, notify.New(logger), logger)
 
@@ -88,6 +111,7 @@ func Run() {
 			for range costTicker.C {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				alertEngine.EvaluateCostAlerts(ctx)
+				alertEngine.EvaluateSpendAnomalies(ctx)
 				cancel()
 			}
 		}()
@@ -202,9 +226,12 @@ func Run() {
 		r.Get("/agents", queryHandler.ListAgents)
 		r.Get("/costs", queryHandler.ListCosts)
 		r.Get("/metrics", queryHandler.ListMetrics)
+		r.Get("/security/incidents", queryHandler.ListSecurityIncidents)
 		r.Get("/projects", queryHandler.ListProjects)
 		// Provisioning (requires an "admin"-scoped key): projects + API keys
 		r.Post("/projects", queryHandler.CreateProject)
+		r.Patch("/projects/{projectID}", queryHandler.UpdateProject)
+		r.Delete("/projects/{projectID}", queryHandler.DeleteProject)
 		r.Get("/keys", queryHandler.ListKeys)
 		r.Post("/keys", queryHandler.CreateKey)
 		r.Delete("/keys/{keyID}", queryHandler.RevokeKey)
@@ -212,7 +239,15 @@ func Run() {
 		// Alert configuration + history
 		r.Get("/alerts", queryHandler.ListAlerts)
 		r.Post("/alerts", queryHandler.CreateAlert)
+		r.Patch("/alerts/{alertID}", queryHandler.UpdateAlert)
 		r.Delete("/alerts/{alertID}", queryHandler.DeleteAlert)
+		// Cost: model price table (admin) + budgets
+		r.Get("/pricing", queryHandler.ListPricing)
+		r.Put("/pricing", queryHandler.UpsertPricing)
+		r.Delete("/pricing/{model}", queryHandler.DeletePricing)
+		r.Get("/budgets", queryHandler.ListBudgets)
+		r.Put("/budgets", queryHandler.UpsertBudget)
+		r.Delete("/budgets/{budgetID}", queryHandler.DeleteBudget)
 
 		// Extension modules (e.g. governance) mount their own routes here. The
 		// OSS binary registers none, so those endpoints do not exist in it.

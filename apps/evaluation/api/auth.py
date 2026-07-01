@@ -9,7 +9,9 @@ collector's dev fallback).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -19,6 +21,7 @@ from . import storage
 
 _DEV_ORG = "00000000-0000-0000-0000-000000000001"
 _DEV_PROJECT = "00000000-0000-0000-0000-000000000002"
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 @dataclass
@@ -31,10 +34,26 @@ def _hash(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def resolve(authorization: Optional[str]) -> Tenant:
+def resolve(
+    authorization: Optional[str],
+    org_header: Optional[str] = None,
+    project_header: Optional[str] = None,
+) -> Tenant:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing api key")
     key = authorization[len("Bearer "):]
+
+    # Trusted first-party channel: the dashboard BFF presents the shared service
+    # token plus X-Splyntra-Org-Id / X-Splyntra-Project-Id headers to scope the
+    # request to the user's ACTIVE org (the BFF has already verified membership).
+    # Honored only on a constant-time token match — mirrors the collector.
+    service_token = os.getenv("COLLECTOR_SERVICE_TOKEN", "")
+    if service_token and hmac.compare_digest(key, service_token):
+        if not org_header or not project_header:
+            raise HTTPException(status_code=400, detail="service token requires X-Splyntra-Org-Id and X-Splyntra-Project-Id")
+        if not _UUID_RE.match(org_header) or not _UUID_RE.match(project_header):
+            raise HTTPException(status_code=400, detail="invalid tenant headers")
+        return Tenant(org_id=org_header, project_id=project_header)
 
     if os.getenv("ENV") == "development" and key == "splyntra_dev_key":
         return Tenant(org_id=_DEV_ORG, project_id=_DEV_PROJECT)
@@ -56,6 +75,10 @@ def resolve(authorization: Optional[str]) -> Tenant:
     return Tenant(org_id=row["org_id"], project_id=row["project_id"])
 
 
-def require_tenant(authorization: Optional[str] = Header(default=None)) -> Tenant:
+def require_tenant(
+    authorization: Optional[str] = Header(default=None),
+    x_splyntra_org_id: Optional[str] = Header(default=None),
+    x_splyntra_project_id: Optional[str] = Header(default=None),
+) -> Tenant:
     """FastAPI dependency."""
-    return resolve(authorization)
+    return resolve(authorization, x_splyntra_org_id, x_splyntra_project_id)

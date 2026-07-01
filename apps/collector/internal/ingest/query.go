@@ -2,10 +2,14 @@
 package ingest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
+	"time"
 
 	"database/sql"
 
@@ -53,21 +57,99 @@ func (q *QueryHandler) ListTraces(w http.ResponseWriter, r *http.Request) {
 
 	tenantInfo := r.Context().Value(auth.TenantContextKey).(*auth.TenantInfo)
 
+	q2 := r.URL.Query()
 	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 100 {
-			limit = parsed
-		}
+	if parsed, err := strconv.Atoi(q2.Get("limit")); err == nil && parsed > 0 && parsed <= 100 {
+		limit = parsed
+	}
+	offset := 0
+	if parsed, err := strconv.Atoi(q2.Get("offset")); err == nil && parsed > 0 {
+		offset = parsed
+	}
+	since := 0
+	if parsed, err := strconv.Atoi(q2.Get("since")); err == nil && parsed > 0 {
+		since = parsed
+	}
+	filter := store.TraceFilter{
+		Limit:    limit,
+		Offset:   offset,
+		AgentID:  q2.Get("agent_id"),
+		Status:   q2.Get("status"),
+		MinRisk:  severityMinRisk(q2.Get("severity")),
+		SinceSec: since,
 	}
 
-	traces, err := q.store.QueryTraces(r.Context(), tenantInfo.OrgID, effectiveProject(r, tenantInfo), limit)
+	traces, total, err := q.store.QueryTraces(r.Context(), tenantInfo.OrgID, effectiveProject(r, tenantInfo), filter)
 	if err != nil {
 		q.logger.Error("query traces failed", zap.Error(err))
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, map[string]interface{}{"traces": traces, "total": len(traces)})
+	writeJSON(w, map[string]interface{}{"traces": traces, "total": total, "limit": limit, "offset": offset})
+}
+
+// severityMinRisk maps a minimum-severity filter name to the risk_score floor
+// used by trace queries. Unknown/empty → 0 (no filter).
+func severityMinRisk(sev string) int {
+	switch strings.ToLower(sev) {
+	case "low":
+		return 1
+	case "medium":
+		return 25
+	case "high":
+		return 50
+	case "critical":
+		return 90
+	default:
+		return 0
+	}
+}
+
+var validDetectors = map[string]bool{"pii": true, "secrets": true, "injection": true}
+var validSeverities = map[string]bool{"LOW": true, "MEDIUM": true, "HIGH": true, "CRITICAL": true}
+
+// ListSecurityIncidents returns the org/project-wide security detections feed
+// (TRD §14 GET /v1/security/incidents), with detector/severity/time filters and
+// pagination. Every query is tenant-scoped via effectiveProject + org_id.
+func (q *QueryHandler) ListSecurityIncidents(w http.ResponseWriter, r *http.Request) {
+	if q.store == nil {
+		http.Error(w, `{"error":"storage not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	tenantInfo := r.Context().Value(auth.TenantContextKey).(*auth.TenantInfo)
+	qp := r.URL.Query()
+
+	limit := 50
+	if n, err := strconv.Atoi(qp.Get("limit")); err == nil && n > 0 && n <= 100 {
+		limit = n
+	}
+	offset := 0
+	if n, err := strconv.Atoi(qp.Get("offset")); err == nil && n > 0 {
+		offset = n
+	}
+	since := 0
+	if n, err := strconv.Atoi(qp.Get("since")); err == nil && n > 0 {
+		since = n
+	}
+	detector := qp.Get("detector")
+	if detector != "" && !validDetectors[detector] {
+		detector = ""
+	}
+	severity := strings.ToUpper(qp.Get("severity"))
+	if !validSeverities[severity] {
+		severity = ""
+	}
+
+	incidents, total, err := q.store.QueryIncidents(r.Context(), tenantInfo.OrgID, effectiveProject(r, tenantInfo), store.IncidentFilter{
+		Limit: limit, Offset: offset, Detector: detector, MinSeverity: severity, SinceSec: since,
+	})
+	if err != nil {
+		q.logger.Error("query incidents failed", zap.Error(err))
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"incidents": incidents, "total": total, "limit": limit, "offset": offset})
 }
 
 // GetTrace returns a full trace with spans and detections.
@@ -102,11 +184,24 @@ func (q *QueryHandler) GetTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, map[string]interface{}{
+	// The stored trace row carries the authoritative risk score, agent, status,
+	// and timing — so the detail view matches the list instead of recomputing.
+	trace, err := q.store.QueryTraceByID(r.Context(), traceID, tenantInfo.OrgID, project)
+	if err != nil {
+		q.logger.Error("query trace failed", zap.Error(err))
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	resp := map[string]interface{}{
 		"trace_id":   traceID,
 		"spans":      spans,
 		"detections": detections,
-	})
+	}
+	if trace != nil {
+		resp["trace"] = trace
+	}
+	writeJSON(w, resp)
 }
 
 // agentResponse is an agent stat row enriched with registry metadata.
@@ -127,7 +222,12 @@ func (q *QueryHandler) ListAgents(w http.ResponseWriter, r *http.Request) {
 	tenantInfo := r.Context().Value(auth.TenantContextKey).(*auth.TenantInfo)
 	project := effectiveProject(r, tenantInfo)
 
-	agents, err := q.store.QueryAgents(r.Context(), tenantInfo.OrgID, project)
+	windowSec := 0 // all-time by default
+	if v, err := strconv.Atoi(r.URL.Query().Get("window")); err == nil && v > 0 && v <= 90*86400 {
+		windowSec = v
+	}
+
+	agents, err := q.store.QueryAgents(r.Context(), tenantInfo.OrgID, project, windowSec)
 	if err != nil {
 		q.logger.Error("query agents failed", zap.Error(err))
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
@@ -187,10 +287,18 @@ func (q *QueryHandler) ListCosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	byWorkflow, err := q.store.QueryCostByWorkflow(r.Context(), tenantInfo.OrgID, project)
+	if err != nil {
+		q.logger.Error("query cost by workflow failed", zap.Error(err))
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+
 	writeJSON(w, map[string]interface{}{
-		"models":     costs,
-		"summary":    summary,
-		"by_project": byProject,
+		"models":      costs,
+		"summary":     summary,
+		"by_project":  byProject,
+		"by_workflow": byWorkflow,
 	})
 }
 
@@ -215,8 +323,27 @@ func (q *QueryHandler) ListMetrics(w http.ResponseWriter, r *http.Request) {
 			interval = n
 		}
 	}
+	// Bound the bucket count so a small interval over a large window can't force
+	// a huge aggregation/response — raise the interval to keep points <= 5000.
+	const maxBuckets = 5000
+	if window/interval > maxBuckets {
+		interval = (window + maxBuckets - 1) / maxBuckets
+	}
+	// offset shifts the window back for period-over-period comparison; capped to
+	// 90d so it stays within retention.
+	offset := 0
+	if n, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && n > 0 && n <= 90*86400 {
+		offset = n
+	}
 
-	points, err := q.store.QueryMetricsTimeseries(r.Context(), tenantInfo.OrgID, effectiveProject(r, tenantInfo), window, interval)
+	filter := store.MetricsFilter{
+		WindowSec:   window,
+		IntervalSec: interval,
+		OffsetSec:   offset,
+		AgentID:     r.URL.Query().Get("agent_id"),
+		Model:       r.URL.Query().Get("model"),
+	}
+	points, err := q.store.QueryMetricsTimeseries(r.Context(), tenantInfo.OrgID, effectiveProject(r, tenantInfo), filter)
 	if err != nil {
 		q.logger.Error("query metrics failed", zap.Error(err))
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
@@ -269,6 +396,96 @@ func (q *QueryHandler) ListAlerts(w http.ResponseWriter, r *http.Request) {
 }
 
 // CreateAlert creates an alert config for the org.
+var validAlertTypes = map[string]bool{"risk_threshold": true, "cost_threshold": true, "spend_anomaly": true}
+var validAlertChannels = map[string]bool{"email": true, "slack": true, "webhook": true}
+
+// validAlertURL accepts an empty string (meaning: use the global fallback) or a
+// well-formed http(s) URL. The private-IP/SSRF policy is enforced at delivery
+// time by the notifier (which is env-configurable), not here.
+func validAlertURL(raw string) bool {
+	if raw == "" {
+		return true
+	}
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+func validateChannels(chs []string) (string, bool) {
+	if len(chs) == 0 {
+		return "at least one channel is required", false
+	}
+	for _, c := range chs {
+		if !validAlertChannels[c] {
+			return "unknown channel: " + c, false
+		}
+	}
+	return "", true
+}
+
+// alertConfigFields is the validated subset of an alert's config JSON.
+type alertConfigFields struct {
+	Threshold       *float64 `json:"threshold"`
+	WindowDays      *int     `json:"window_days"`
+	Factor          *float64 `json:"factor"`
+	WebhookURL      string   `json:"webhook_url"`
+	SlackWebhookURL string   `json:"slack_webhook_url"`
+}
+
+func parseAlertConfig(raw json.RawMessage) (alertConfigFields, bool) {
+	var c alertConfigFields
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return c, false
+		}
+	}
+	return c, true
+}
+
+// validateAlertConfig enforces threshold bounds for the alert type and URL
+// formats. requireThreshold is true on create (threshold is mandatory).
+func validateAlertConfig(raw json.RawMessage, alertType string, requireThreshold bool) (string, bool) {
+	c, ok := parseAlertConfig(raw)
+	if !ok {
+		return "invalid config json", false
+	}
+	if alertType == "spend_anomaly" {
+		// Uses window_days + factor, not a threshold.
+		if c.WindowDays != nil && *c.WindowDays < 1 {
+			return "window_days must be >= 1", false
+		}
+		if c.Factor != nil && *c.Factor <= 1 {
+			return "factor must be greater than 1", false
+		}
+		if !validAlertURL(c.WebhookURL) || !validAlertURL(c.SlackWebhookURL) {
+			return "webhook/slack url must be a valid http(s) URL", false
+		}
+		return "", true
+	}
+	if c.Threshold == nil {
+		if requireThreshold {
+			return "config.threshold is required", false
+		}
+	} else {
+		switch alertType {
+		case "risk_threshold":
+			if *c.Threshold < 1 || *c.Threshold > 100 {
+				return "risk threshold must be between 1 and 100", false
+			}
+		default: // cost_threshold or unknown-on-update
+			if *c.Threshold <= 0 {
+				return "threshold must be greater than 0", false
+			}
+		}
+	}
+	if !validAlertURL(c.WebhookURL) {
+		return "webhook_url must be a valid http(s) URL", false
+	}
+	if !validAlertURL(c.SlackWebhookURL) {
+		return "slack_webhook_url must be a valid http(s) URL", false
+	}
+	return "", true
+}
+
 func (q *QueryHandler) CreateAlert(w http.ResponseWriter, r *http.Request) {
 	tenantInfo := r.Context().Value(auth.TenantContextKey).(*auth.TenantInfo)
 	if q.pg == nil {
@@ -286,8 +503,21 @@ func (q *QueryHandler) CreateAlert(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	if body.Name == "" || body.Type == "" {
-		http.Error(w, `{"error":"name and type are required"}`, http.StatusBadRequest)
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		http.Error(w, `{"error":"name is required"}`, http.StatusBadRequest)
+		return
+	}
+	if !validAlertTypes[body.Type] {
+		http.Error(w, `{"error":"type must be risk_threshold or cost_threshold"}`, http.StatusBadRequest)
+		return
+	}
+	if msg, ok := validateChannels(body.Channels); !ok {
+		http.Error(w, `{"error":"`+jsonEscape(msg)+`"}`, http.StatusBadRequest)
+		return
+	}
+	if msg, ok := validateAlertConfig(body.Config, body.Type, true); !ok {
+		http.Error(w, `{"error":"`+jsonEscape(msg)+`"}`, http.StatusBadRequest)
 		return
 	}
 	id, err := q.pg.CreateAlert(r.Context(), &store.Alert{
@@ -326,6 +556,71 @@ func (q *QueryHandler) DeleteAlert(w http.ResponseWriter, r *http.Request) {
 		}
 		q.logger.Error("delete alert failed", zap.Error(err))
 		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// UpdateAlert applies a partial update to an alert (name, config, channels, or
+// active state), scoped to the org. Powers both editing a rule and pausing it.
+func (q *QueryHandler) UpdateAlert(w http.ResponseWriter, r *http.Request) {
+	tenantInfo := r.Context().Value(auth.TenantContextKey).(*auth.TenantInfo)
+	if q.pg == nil {
+		http.Error(w, `{"error":"metadata store not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	id := chi.URLParam(r, "alertID")
+	if id == "" {
+		http.Error(w, `{"error":"alert_id required"}`, http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Name     *string         `json:"name"`
+		Type     string          `json:"type"` // used only to bound config validation; not persisted
+		Config   json.RawMessage `json:"config"`
+		Channels *[]string       `json:"channels"`
+		IsActive *bool           `json:"is_active"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	var name *string
+	if body.Name != nil {
+		trimmed := strings.TrimSpace(*body.Name)
+		if trimmed == "" {
+			http.Error(w, `{"error":"name cannot be empty"}`, http.StatusBadRequest)
+			return
+		}
+		name = &trimmed
+	}
+	if body.Channels != nil {
+		if msg, ok := validateChannels(*body.Channels); !ok {
+			http.Error(w, `{"error":"`+jsonEscape(msg)+`"}`, http.StatusBadRequest)
+			return
+		}
+	}
+	if len(body.Config) > 0 {
+		if msg, ok := validateAlertConfig(body.Config, body.Type, false); !ok {
+			http.Error(w, `{"error":"`+jsonEscape(msg)+`"}`, http.StatusBadRequest)
+			return
+		}
+	}
+
+	err := q.pg.UpdateAlert(r.Context(), tenantInfo.OrgID, id, store.AlertUpdate{
+		Name:     name,
+		Config:   body.Config,
+		Channels: body.Channels,
+		IsActive: body.IsActive,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		q.logger.Error("update alert failed", zap.Error(err))
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -382,6 +677,87 @@ func (q *QueryHandler) CreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, p)
+}
+
+// UpdateProject renames and/or archives a project (admin scope). Both fields are
+// optional so the same endpoint powers a rename, an archive, and an unarchive.
+func (q *QueryHandler) UpdateProject(w http.ResponseWriter, r *http.Request) {
+	t, ok := q.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	id := chi.URLParam(r, "projectID")
+	if id == "" {
+		http.Error(w, `{"error":"project_id required"}`, http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Name     *string `json:"name"`
+		Archived *bool   `json:"archived"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Name != nil {
+		name := strings.TrimSpace(*body.Name)
+		if name == "" {
+			http.Error(w, `{"error":"name cannot be empty"}`, http.StatusBadRequest)
+			return
+		}
+		if err := q.pg.RenameProject(r.Context(), t.OrgID, id, name); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+				return
+			}
+			q.logger.Error("rename project failed", zap.Error(err))
+			http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+			return
+		}
+	}
+	if body.Archived != nil {
+		if err := q.pg.SetProjectArchived(r.Context(), t.OrgID, id, *body.Archived); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+				return
+			}
+			q.logger.Error("archive project failed", zap.Error(err))
+			http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteProject hard-deletes a project and purges its trace data. Postgres FK
+// cascades clear agents/alerts/keys; ClickHouse rows are purged best-effort
+// (async mutations) — a partial purge is logged, not surfaced as an error, since
+// the project is already gone from Postgres and thus unreachable.
+func (q *QueryHandler) DeleteProject(w http.ResponseWriter, r *http.Request) {
+	t, ok := q.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	id := chi.URLParam(r, "projectID")
+	if id == "" {
+		http.Error(w, `{"error":"project_id required"}`, http.StatusBadRequest)
+		return
+	}
+	if err := q.pg.DeleteProject(r.Context(), t.OrgID, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		q.logger.Error("delete project failed", zap.Error(err))
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	if q.store != nil {
+		if err := q.store.DeleteProjectData(r.Context(), t.OrgID, id); err != nil {
+			q.logger.Warn("clickhouse project purge partial", zap.String("project", id), zap.Error(err))
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ListKeys returns API-key metadata for the org (never the secret).
@@ -460,4 +836,178 @@ func (q *QueryHandler) RotateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"key": plaintext})
+}
+
+// ─── Pricing admin (model_prices) ───────────────────────────────────────────
+
+// ListPricing returns the model price table plus any models seen at ingest that
+// are unpriced (cost recorded as $0) so operators can fix understated spend.
+func (q *QueryHandler) ListPricing(w http.ResponseWriter, r *http.Request) {
+	if _, ok := q.requireAdmin(w, r); !ok {
+		return
+	}
+	prices, err := q.pg.ListModelPrices(r.Context())
+	if err != nil {
+		q.logger.Error("list pricing failed", zap.Error(err))
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"prices": prices, "unpriced": store.UnpricedModels()})
+}
+
+// UpsertPricing inserts/updates a model's price and hot-reloads the collector's
+// in-memory table so it takes effect immediately (admin scope).
+func (q *QueryHandler) UpsertPricing(w http.ResponseWriter, r *http.Request) {
+	if _, ok := q.requireAdmin(w, r); !ok {
+		return
+	}
+	var body struct {
+		Model           string  `json:"model"`
+		PromptPer1K     float64 `json:"prompt_per_1k"`
+		CompletionPer1K float64 `json:"completion_per_1k"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	body.Model = strings.TrimSpace(body.Model)
+	if body.Model == "" {
+		http.Error(w, `{"error":"model is required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.PromptPer1K < 0 || body.CompletionPer1K < 0 {
+		http.Error(w, `{"error":"prices must be >= 0"}`, http.StatusBadRequest)
+		return
+	}
+	if err := q.pg.UpsertModelPrice(r.Context(), body.Model, body.PromptPer1K, body.CompletionPer1K); err != nil {
+		q.logger.Error("upsert pricing failed", zap.Error(err))
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	q.reloadPrices(r.Context())
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeletePricing removes a model from the price table (admin scope).
+func (q *QueryHandler) DeletePricing(w http.ResponseWriter, r *http.Request) {
+	if _, ok := q.requireAdmin(w, r); !ok {
+		return
+	}
+	model := chi.URLParam(r, "model")
+	if err := q.pg.DeleteModelPrice(r.Context(), model); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		q.logger.Error("delete pricing failed", zap.Error(err))
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	q.reloadPrices(r.Context())
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// reloadPrices refreshes the collector's in-memory price table from Postgres.
+func (q *QueryHandler) reloadPrices(ctx context.Context) {
+	if q.pg == nil {
+		return
+	}
+	if prices, err := q.pg.LoadModelPrices(ctx); err == nil {
+		store.SetModelPrices(prices)
+	}
+}
+
+// ─── Budgets ─────────────────────────────────────────────────────────────────
+
+type budgetView struct {
+	store.Budget
+	SpentUSD    float64 `json:"spent_usd"`
+	ForecastUSD float64 `json:"forecast_usd"`
+	PctUsed     float64 `json:"pct_used"`
+}
+
+// ListBudgets returns each budget with month-to-date spend, a linear month-end
+// forecast, and percent consumed.
+func (q *QueryHandler) ListBudgets(w http.ResponseWriter, r *http.Request) {
+	tenantInfo := r.Context().Value(auth.TenantContextKey).(*auth.TenantInfo)
+	if q.pg == nil {
+		writeJSON(w, map[string]interface{}{"budgets": []budgetView{}})
+		return
+	}
+	budgets, err := q.pg.ListBudgets(r.Context(), tenantInfo.OrgID)
+	if err != nil {
+		q.logger.Error("list budgets failed", zap.Error(err))
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	now := time.Now().UTC()
+	day := now.Day()
+	daysInMonth := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+
+	views := make([]budgetView, 0, len(budgets))
+	for _, b := range budgets {
+		var spent float64
+		if q.store != nil {
+			spent, _ = q.store.MonthToDateCostUSD(r.Context(), tenantInfo.OrgID, b.ProjectID)
+		}
+		forecast := spent
+		if day > 0 {
+			forecast = spent / float64(day) * float64(daysInMonth)
+		}
+		pct := 0.0
+		if b.MonthlyLimitUSD > 0 {
+			pct = spent / b.MonthlyLimitUSD * 100
+		}
+		views = append(views, budgetView{Budget: b, SpentUSD: spent, ForecastUSD: forecast, PctUsed: pct})
+	}
+	writeJSON(w, map[string]interface{}{"budgets": views})
+}
+
+// UpsertBudget sets a project's (or org-wide) monthly budget (admin scope).
+func (q *QueryHandler) UpsertBudget(w http.ResponseWriter, r *http.Request) {
+	t, ok := q.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		ProjectID       string  `json:"project_id"`
+		MonthlyLimitUSD float64 `json:"monthly_limit_usd"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if body.MonthlyLimitUSD <= 0 {
+		http.Error(w, `{"error":"monthly_limit_usd must be > 0"}`, http.StatusBadRequest)
+		return
+	}
+	var projectID *string
+	if body.ProjectID != "" {
+		projectID = &body.ProjectID
+	}
+	if err := q.pg.UpsertBudget(r.Context(), t.OrgID, projectID, body.MonthlyLimitUSD); err != nil {
+		q.logger.Error("upsert budget failed", zap.Error(err))
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteBudget removes a budget (admin scope).
+func (q *QueryHandler) DeleteBudget(w http.ResponseWriter, r *http.Request) {
+	t, ok := q.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	id := chi.URLParam(r, "budgetID")
+	if err := q.pg.DeleteBudget(r.Context(), t.OrgID, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		q.logger.Error("delete budget failed", zap.Error(err))
+		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

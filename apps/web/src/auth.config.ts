@@ -3,7 +3,10 @@ import type { NextAuthConfig } from "next-auth";
 
 // Edge-safe config (no DB / bcrypt). Shared by the middleware and the full
 // Node instance. The `authorized` callback gates every app route behind login.
-const PUBLIC = ["/login", "/signup", "/accept-invite"];
+// SCIM (RFC 7644) is authenticated by a per-org Bearer token in the route
+// handler, not a session cookie — so it must bypass the login gate here. No SCIM
+// route exists in the open edition; the handler is composed in by the cloud build.
+const PUBLIC = ["/login", "/signup", "/accept-invite", "/api/scim"];
 
 export const authConfig: NextAuthConfig = {
   // Self-hosted (Docker/Helm) serves behind a service name / arbitrary host, so

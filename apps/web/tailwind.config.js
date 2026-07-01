@@ -6,18 +6,21 @@ module.exports = {
   theme: {
     extend: {
       colors: {
+        // Monochrome brand scale matching the logo: white → silver → grey → black.
+        // Primary UI (buttons, links) uses 600+ (near-black); 100–300 are the
+        // silver/light tones for rings, borders, and surfaces.
         splyntra: {
-          50: "#eef2ff",
-          100: "#e0e7ff",
-          200: "#c7d2fe",
-          300: "#a5b4fc",
-          400: "#818cf8",
-          500: "#6366f1",
-          600: "#4f46e5",
-          700: "#4338ca",
-          800: "#3730a3",
-          900: "#312e81",
-          950: "#1e1b4b",
+          50: "#f7f7f8",
+          100: "#eeeef0",
+          200: "#dcdce0",
+          300: "#c2c2c8",
+          400: "#9a9aa2",
+          500: "#71717a",
+          600: "#27272a",
+          700: "#1c1c1f",
+          800: "#141416",
+          900: "#0b0b0d",
+          950: "#060607",
         },
         risk: {
           low: "#10b981",
@@ -38,6 +41,7 @@ module.exports = {
       animation: {
         'fade-in': 'fadeIn 0.3s ease-out',
         'slide-up': 'slideUp 0.3s ease-out',
+        'levitate': 'levitate 3s ease-in-out infinite',
       },
       keyframes: {
         fadeIn: {
@@ -47,6 +51,10 @@ module.exports = {
         slideUp: {
           '0%': { opacity: '0', transform: 'translateY(8px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        levitate: {
+          '0%, 100%': { transform: 'translateY(0)' },
+          '50%': { transform: 'translateY(-8px)' },
         },
       },
     },

@@ -3,6 +3,12 @@
 -- Objects live in the `splyntra` database (matching the collector's DSN) and are
 -- fully qualified so initialization is correct regardless of the session's
 -- current database.
+--
+-- UPGRADE NOTE: traces/spans/detections use ReplacingMergeTree for idempotent
+-- ingestion (see per-table notes). ClickHouse cannot ALTER a table's engine in
+-- place, so an existing deployment created before this change must be re-initialized
+-- (`docker compose down -v` the ClickHouse volume, or rebuild the three tables)
+-- to pick it up. Fresh installs need no action.
 
 CREATE DATABASE IF NOT EXISTS splyntra;
 
@@ -31,7 +37,11 @@ CREATE TABLE IF NOT EXISTS splyntra.traces (
     -- Partition and sort for efficient queries
     INDEX idx_agent_id agent_id TYPE bloom_filter GRANULARITY 4,
     INDEX idx_risk risk_score TYPE minmax GRANULARITY 4
-) ENGINE = MergeTree()
+)
+-- ReplacingMergeTree makes ingestion idempotent (TRD §14): a re-sent trace has
+-- the same (org, project, started_at, trace_id) sort key and collapses to the
+-- latest ingested_at on merge. Reads that must be exact use FINAL.
+ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(started_at)
 ORDER BY (org_id, project_id, started_at, trace_id)
 TTL toDateTime(started_at) + INTERVAL 90 DAY
@@ -63,7 +73,10 @@ CREATE TABLE IF NOT EXISTS splyntra.spans (
     ingested_at DateTime64(3) DEFAULT now64(3),
 
     INDEX idx_type type TYPE set(4) GRANULARITY 1
-) ENGINE = MergeTree()
+)
+-- Idempotent: a re-sent span has the same (org, project, trace_id, started_at,
+-- span_id) sort key and collapses to the latest ingested_at on merge.
+ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(started_at)
 ORDER BY (org_id, project_id, trace_id, started_at, span_id)
 TTL toDateTime(started_at) + INTERVAL 90 DAY
@@ -85,9 +98,13 @@ CREATE TABLE IF NOT EXISTS splyntra.detections (
 
     INDEX idx_severity severity TYPE set(4) GRANULARITY 1,
     INDEX idx_detector detector TYPE set(3) GRANULARITY 1
-) ENGINE = MergeTree()
+)
+-- Idempotent: dedup identity is the finding itself (trace+span+detector+
+-- category), NOT the insert-time detected_at — so re-detecting a re-ingested
+-- span collapses instead of duplicating. Version = detected_at (latest wins).
+ENGINE = ReplacingMergeTree(detected_at)
 PARTITION BY toYYYYMM(detected_at)
-ORDER BY (org_id, project_id, detected_at, trace_id)
+ORDER BY (org_id, project_id, trace_id, span_id, detector, category)
 TTL toDateTime(detected_at) + INTERVAL 180 DAY
 SETTINGS index_granularity = 8192;
 

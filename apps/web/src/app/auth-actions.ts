@@ -2,8 +2,11 @@
 "use server";
 
 import bcrypt from "bcryptjs";
+import { revalidatePath } from "next/cache";
 import { pool, roleAtLeast } from "@/lib/db";
 import { auth, signIn } from "@/auth";
+
+const VALID_ROLES = new Set(["owner", "admin", "member", "viewer"]);
 
 // The seeded dev organization (migrations/postgres/001_init.sql). First signup
 // joins it as owner; subsequent signups join as members.
@@ -61,12 +64,39 @@ export async function signupAction(_prev: unknown, formData: FormData) {
   return { error: "" };
 }
 
-async function requireAdminOrg(): Promise<string> {
+// Authorizes the caller as an admin of their active org, verifying the role
+// against the DB membership — NOT the JWT `role`, which a client can set via
+// next-auth update() (that would be a privilege-escalation hole). Returns the
+// caller's org and user id.
+async function requireAdminOrg(): Promise<{ orgId: string; userId: string }> {
   const session = await auth();
-  const role = (session?.user as { role?: string })?.role;
+  const userId = (session?.user as { id?: string })?.id;
   const orgId = (session?.user as { orgId?: string })?.orgId;
-  if (!orgId || !roleAtLeast(role, "admin")) throw new Error("forbidden");
-  return orgId;
+  if (!userId || !orgId) throw new Error("forbidden");
+  const { rows } = await pool.query(
+    "SELECT role FROM memberships WHERE user_id = $1 AND org_id = $2",
+    [userId, orgId]
+  );
+  if (!roleAtLeast(rows[0]?.role, "admin")) throw new Error("forbidden");
+  return { orgId, userId };
+}
+
+// ownerCount returns how many owners the org currently has — used to refuse the
+// removal/demotion of the last owner (which would orphan the org).
+async function ownerCount(orgId: string): Promise<number> {
+  const { rows } = await pool.query(
+    "SELECT COUNT(*)::int AS n FROM memberships WHERE org_id = $1 AND role = 'owner'",
+    [orgId]
+  );
+  return rows[0]?.n ?? 0;
+}
+
+async function memberRole(orgId: string, userId: string): Promise<string | undefined> {
+  const { rows } = await pool.query(
+    "SELECT role FROM memberships WHERE user_id = $1 AND org_id = $2",
+    [userId, orgId]
+  );
+  return rows[0]?.role as string | undefined;
 }
 
 function randomToken(): string {
@@ -77,27 +107,61 @@ function randomToken(): string {
 }
 
 export async function inviteMemberAction(_prev: unknown, formData: FormData) {
-  const orgId = await requireAdminOrg();
+  const { orgId, userId } = await requireAdminOrg();
   const email = String(formData.get("email") || "").toLowerCase().trim();
   const role = String(formData.get("role") || "member");
-  if (!email) return { error: "Email required." };
-  const token = randomToken();
-  await pool.query(
-    "INSERT INTO invitations (org_id, email, role, token) VALUES ($1,$2,$3,$4)",
-    [orgId, email, role, token]
+  if (!email) return { error: "Email is required.", token: "" };
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return { error: "Enter a valid email address.", token: "" };
+  if (!VALID_ROLES.has(role) || role === "owner") return { error: "Invalid role.", token: "" };
+  // Don't invite someone who is already a member.
+  const existing = await pool.query(
+    `SELECT 1 FROM memberships m JOIN users u ON u.id = m.user_id
+     WHERE m.org_id = $1 AND u.email = $2`,
+    [orgId, email]
   );
+  if ((existing.rowCount ?? 0) > 0) return { error: "That person is already a member.", token: "" };
+
+  const token = randomToken();
+  // Supersede any prior pending invite for the same email (idempotent re-invite).
+  await pool.query(
+    `INSERT INTO invitations (org_id, email, role, token, invited_by)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [orgId, email, role, token, userId]
+  );
+  revalidatePath("/settings/team");
   return { error: "", token };
 }
 
+export async function revokeInviteAction(formData: FormData) {
+  const { orgId } = await requireAdminOrg();
+  const id = String(formData.get("invite_id") || "");
+  await pool.query(
+    "DELETE FROM invitations WHERE id = $1 AND org_id = $2 AND accepted_at IS NULL",
+    [id, orgId]
+  );
+  revalidatePath("/settings/team");
+}
+
 export async function updateRoleAction(formData: FormData) {
-  const orgId = await requireAdminOrg();
+  const { orgId } = await requireAdminOrg();
   const userId = String(formData.get("user_id") || "");
   const role = String(formData.get("role") || "member");
+  if (!VALID_ROLES.has(role)) return;
+  // Refuse to demote the last owner (would leave the org without an owner).
+  if (role !== "owner" && (await memberRole(orgId, userId)) === "owner" && (await ownerCount(orgId)) <= 1) {
+    return;
+  }
   await pool.query("UPDATE memberships SET role = $1 WHERE user_id = $2 AND org_id = $3", [role, userId, orgId]);
+  revalidatePath("/settings/team");
 }
 
 export async function removeMemberAction(formData: FormData) {
-  const orgId = await requireAdminOrg();
+  const { orgId } = await requireAdminOrg();
   const userId = String(formData.get("user_id") || "");
+  // Refuse to remove the last owner.
+  if ((await memberRole(orgId, userId)) === "owner" && (await ownerCount(orgId)) <= 1) {
+    return;
+  }
   await pool.query("DELETE FROM memberships WHERE user_id = $1 AND org_id = $2", [userId, orgId]);
+  revalidatePath("/settings/team");
 }

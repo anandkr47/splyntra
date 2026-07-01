@@ -4,30 +4,37 @@
 import { useFormState } from "react-dom";
 import Link from "next/link";
 import { signupAction } from "@/app/auth-actions";
-import { AuthCard, Field } from "@/components/auth/AuthCard";
+import { AuthLayout, Field } from "@/components/auth/AuthLayout";
+import { OAuthButtons } from "@/components/auth/OAuthButtons";
 
 export default function SignupPage() {
   const [state, formAction] = useFormState(signupAction, { error: "" });
   return (
-    <AuthCard title="Create your Splyntra account">
-      <form action={formAction} className="space-y-3">
-        <Field name="name" type="text" label="Name" />
-        <Field name="email" type="email" label="Email" />
-        <Field name="password" type="password" label="Password (8+ chars)" />
-        {state?.error ? <p className="text-sm text-red-600">{state.error}</p> : null}
+    <AuthLayout
+      title="Create your account"
+      subtitle="Start observing and securing your agents"
+      footer={
+        <>
+          Already have an account?{" "}
+          <Link href="/login" className="font-medium text-zinc-900 underline-offset-2 hover:underline dark:text-white">
+            Sign in
+          </Link>
+        </>
+      }
+    >
+      <OAuthButtons />
+      <form action={formAction} className="space-y-4">
+        <Field name="name" type="text" label="Name" autoComplete="name" />
+        <Field name="email" type="email" label="Email" autoComplete="email" />
+        <Field name="password" type="password" label="Password (8+ chars)" autoComplete="new-password" />
+        {state?.error ? <p className="text-sm text-red-600 dark:text-red-400">{state.error}</p> : null}
         <button
           type="submit"
-          className="w-full rounded-lg bg-splyntra-600 py-2 text-sm font-medium text-white hover:bg-splyntra-700"
+          className="w-full rounded-lg bg-zinc-900 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200"
         >
           Create account
         </button>
       </form>
-      <p className="mt-4 text-center text-sm text-gray-500">
-        Already have an account?{" "}
-        <Link href="/login" className="text-splyntra-600 hover:underline">
-          Sign in
-        </Link>
-      </p>
-    </AuthCard>
+    </AuthLayout>
   );
 }

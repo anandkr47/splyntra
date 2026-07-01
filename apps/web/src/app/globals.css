@@ -10,8 +10,8 @@
   --sidebar-bg: #ffffff;
   --card-bg: #ffffff;
   --border: #e5e7eb;
-  --accent: #4f46e5;
-  --accent-light: #eef2ff;
+  --accent: #18181b;
+  --accent-light: #f4f4f5;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -21,8 +21,8 @@
     --sidebar-bg: #0f0f12;
     --card-bg: #18181b;
     --border: #27272a;
-    --accent: #6366f1;
-    --accent-light: #1e1b4b;
+    --accent: #a1a1aa;
+    --accent-light: #27272a;
   }
 }
 
@@ -67,7 +67,7 @@ body {
 /* Utility classes */
 @layer utilities {
   .text-gradient {
-    @apply bg-clip-text text-transparent bg-gradient-to-r from-splyntra-600 to-splyntra-400;
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-gray-900 via-gray-600 to-gray-400 dark:from-white dark:via-gray-300 dark:to-gray-500;
   }
   .glass-card {
     @apply bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm border border-gray-200/60 dark:border-gray-800/60;

@@ -5,6 +5,12 @@ const nextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
 
+  images: {
+    remotePatterns: [
+      { protocol: "https", hostname: "avatars.githubusercontent.com" },
+    ],
+  },
+
   // API calls are proxied to the collector at runtime by the route handler at
   // src/app/api/v1/[...path]/route.ts. (next.config rewrites bake the URL at
   // build time, which breaks Docker/Helm where the collector is a service name.)
@@ -22,7 +28,7 @@ const nextConfig = {
           { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
           {
             key: "Content-Security-Policy",
-            value: "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'",
+            value: "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'",
           },
         ],
       },

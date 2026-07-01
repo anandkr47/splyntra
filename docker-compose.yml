@@ -102,6 +102,17 @@ services:
       VALKEY_ADDR: "valkey:6379"
       RATE_LIMIT_RPS: "1000"
       CORS_ORIGINS: "http://localhost:3000"
+      # Trusted BFF→collector/eval channel: when set, the dashboard can assert the
+      # tenant via X-Splyntra-Org-Id headers. Leave blank for single-tenant self-host.
+      COLLECTOR_SERVICE_TOKEN: "${COLLECTOR_SERVICE_TOKEN:-}"
+      # Alert notification channels (optional — leave blank to disable)
+      ALERT_WEBHOOK_URL: "${ALERT_WEBHOOK_URL:-}"
+      ALERT_SLACK_WEBHOOK_URL: "${ALERT_SLACK_WEBHOOK_URL:-}"
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASS: "${SMTP_PASS:-}"
+      SMTP_FROM: "${SMTP_FROM:-}"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:4318/health"]
       interval: 10s
@@ -144,6 +155,8 @@ services:
       EVAL_BUCKET: "splyntra-datasets"
       EVAL_LLM_API_KEY: "${EVAL_LLM_API_KEY:-}"
       EVAL_LLM_MODEL: "${EVAL_LLM_MODEL:-gpt-4o-mini}"
+      # Honors the trusted BFF header path for per-org scoping (blank = API-key only).
+      COLLECTOR_SERVICE_TOKEN: "${COLLECTOR_SERVICE_TOKEN:-}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health').status==200 else 1)"]
       interval: 10s
@@ -172,6 +185,9 @@ services:
       # users (so no per-user API key is needed to view data). Override per-org
       # in production.
       SPLYNTRA_API_KEY: "${SPLYNTRA_API_KEY:-splyntra_dev_key}"
+      # When set, the BFF attaches this token + the active org's X-Splyntra-Org-Id
+      # to collector/eval requests (multi-tenant scoping). Blank for single-tenant.
+      COLLECTOR_SERVICE_TOKEN: "${COLLECTOR_SERVICE_TOKEN:-}"
     depends_on:
       postgres:
         condition: service_healthy

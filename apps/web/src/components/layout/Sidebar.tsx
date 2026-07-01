@@ -14,17 +14,20 @@ import {
   ClipboardCheck,
   FolderKanban,
   Bell,
+  ShieldAlert,
   Users,
   ScrollText,
   Scale,
   KeyRound,
   CreditCard,
   Building2,
-  ChevronDown,
+  Fingerprint,
+  ShieldCheck,
   LogOut,
   type LucideIcon,
 } from "lucide-react";
 import { useProjects } from "@/lib/hooks";
+import { Select } from "@/components/ui/Select";
 import { useProject } from "@/lib/project-context";
 import { features } from "@/lib/features";
 import { navSlotItems, slotWidgets } from "@/lib/slots";
@@ -35,6 +38,8 @@ const ICONS: Record<string, LucideIcon> = {
   ScrollText,
   Scale,
   KeyRound,
+  Fingerprint,
+  ShieldCheck,
   CreditCard,
   Building2,
   Users,
@@ -48,6 +53,7 @@ const navItems: { href: string; label: string; icon: LucideIcon }[] = [
   { href: "/agents", label: "Agents", icon: Bot },
   { href: "/metrics", label: "Metrics", icon: LineChart },
   { href: "/evaluations", label: "Evaluation", icon: ClipboardCheck },
+  { href: "/security", label: "Security", icon: ShieldAlert },
   { href: "/costs", label: "Costs", icon: DollarSign },
   { href: "/projects", label: "Projects", icon: FolderKanban },
   { href: "/alerts", label: "Alerts", icon: Bell },
@@ -157,21 +163,16 @@ function ProjectSelector() {
   return (
     <label className="block">
       <span className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500">Project</span>
-      <div className="relative">
-        <select
-          value={projectId}
-          onChange={(e) => setProjectId(e.target.value)}
-          className="w-full appearance-none rounded-lg border border-gray-200 bg-gray-50 py-2 pl-3 pr-8 text-[13px] font-medium text-gray-700 outline-none transition-colors focus:border-splyntra-400 focus:bg-white focus:ring-2 focus:ring-splyntra-100 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:focus:bg-gray-800"
-        >
-          <option value="">All projects</option>
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name} ({p.environment})
-            </option>
-          ))}
-        </select>
-        <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
-      </div>
+      <Select
+        value={projectId}
+        onValueChange={setProjectId}
+        ariaLabel="Active project"
+        className="w-full"
+        options={[
+          { value: "", label: "All projects" },
+          ...projects.map((p) => ({ value: p.id, label: `${p.name} (${p.environment})` })),
+        ]}
+      />
     </label>
   );
 }

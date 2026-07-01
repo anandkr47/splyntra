@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Package notify delivers fired-alert notifications to external channels.
-// Delivery is best-effort and fully out-of-band: a failed webhook never blocks
-// ingestion or risk scoring. Channels are configured per-alert; the URLs come
-// from collector environment (one shared destination per channel type in the
-// MVP — per-alert routing is a post-MVP enhancement).
+// Delivery is best-effort and fully out-of-band: dispatch runs on detached
+// background goroutines (bounded), so a slow or hung webhook never blocks
+// ingestion, risk scoring, or the cost evaluator.
+//
+// Channel routing:
+//   - webhook: per-alert URL from config.webhook_url, falls back to ALERT_WEBHOOK_URL.
+//   - slack:   per-alert URL from config.slack_webhook_url, falls back to ALERT_SLACK_WEBHOOK_URL.
+//   - email:   SMTP via SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS; recipient is
+//     config.email_to or the account email.
+//
+// Outbound webhook/Slack URLs are validated against SSRF (scheme + private/
+// loopback/link-local/metadata IPs are rejected) unless an operator opts in with
+// ALERT_ALLOW_PRIVATE_WEBHOOKS=true (for trusted single-tenant self-host).
 package notify
 
 import (
@@ -11,29 +20,60 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/smtp"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
 )
 
+// maxConcurrentDeliveries bounds in-flight notification goroutines so a burst of
+// fired alerts (or slow endpoints) can't spawn unbounded work.
+const maxConcurrentDeliveries = 64
+
+// deliveryTimeout caps the total time for one event's dispatch across channels.
+const deliveryTimeout = 15 * time.Second
+
 // Notifier sends alert notifications to configured channels.
 type Notifier struct {
-	client     *http.Client
-	logger     *zap.Logger
-	webhookURL string
-	slackURL   string
+	client       *http.Client
+	logger       *zap.Logger
+	appURL       string // base URL used in email links
+	webhookURL   string // global fallback
+	slackURL     string // global fallback
+	smtpHost     string
+	smtpPort     string
+	smtpUser     string
+	smtpPass     string
+	smtpFrom     string
+	allowPrivate bool          // permit webhooks to private/loopback hosts (self-host opt-in)
+	sem          chan struct{} // bounds concurrent deliveries
 }
 
-// New builds a Notifier from environment configuration. ALERT_WEBHOOK_URL and
-// ALERT_SLACK_WEBHOOK_URL are both optional; an unset channel is skipped.
+// New builds a Notifier from environment configuration.
 func New(logger *zap.Logger) *Notifier {
+	smtpFrom := os.Getenv("SMTP_FROM")
+	if smtpFrom == "" {
+		smtpFrom = os.Getenv("SMTP_USER")
+	}
+	appURL := firstNonEmpty(os.Getenv("APP_URL"), os.Getenv("NEXT_PUBLIC_APP_URL"), "http://localhost:3000")
 	return &Notifier{
-		client:     &http.Client{Timeout: 5 * time.Second},
-		logger:     logger,
-		webhookURL: os.Getenv("ALERT_WEBHOOK_URL"),
-		slackURL:   os.Getenv("ALERT_SLACK_WEBHOOK_URL"),
+		client:       &http.Client{Timeout: 5 * time.Second},
+		logger:       logger,
+		appURL:       strings.TrimRight(appURL, "/"),
+		webhookURL:   os.Getenv("ALERT_WEBHOOK_URL"),
+		slackURL:     os.Getenv("ALERT_SLACK_WEBHOOK_URL"),
+		smtpHost:     os.Getenv("SMTP_HOST"),
+		smtpPort:     os.Getenv("SMTP_PORT"),
+		smtpUser:     os.Getenv("SMTP_USER"),
+		smtpPass:     os.Getenv("SMTP_PASS"),
+		smtpFrom:     smtpFrom,
+		allowPrivate: strings.EqualFold(os.Getenv("ALERT_ALLOW_PRIVATE_WEBHOOKS"), "true"),
+		sem:          make(chan struct{}, maxConcurrentDeliveries),
 	}
 }
 
@@ -46,23 +86,52 @@ type Event struct {
 	ProjectID string `json:"project_id"`
 }
 
-// Fire dispatches an event to each requested channel. Errors are logged, not
-// returned, so callers can fire-and-forget.
+// ChannelConfig carries per-alert channel destinations (from the alert config
+// JSON). Empty fields fall back to global env configuration.
+type ChannelConfig struct {
+	WebhookURL      string `json:"webhook_url"`
+	SlackWebhookURL string `json:"slack_webhook_url"`
+	EmailTo         string `json:"email_to"`
+}
+
+// Fire dispatches an event to each requested channel (global config only).
 func (n *Notifier) Fire(ctx context.Context, channels []string, e Event) {
-	if n == nil {
+	n.FireWithConfig(ctx, channels, e, ChannelConfig{})
+}
+
+// FireWithConfig dispatches an event out-of-band: it detaches from the caller's
+// context (so a canceled request/message context can't kill delivery) and runs
+// on a bounded background goroutine. It returns immediately.
+func (n *Notifier) FireWithConfig(_ context.Context, channels []string, e Event, cfg ChannelConfig) {
+	if n == nil || len(channels) == 0 {
 		return
 	}
+	select {
+	case n.sem <- struct{}{}:
+	default:
+		n.logger.Warn("alert delivery queue full — dropping notification",
+			zap.String("alert", e.AlertName), zap.String("trace_id", e.TraceID))
+		return
+	}
+	go func() {
+		defer func() { <-n.sem }()
+		ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+		defer cancel()
+		n.dispatch(ctx, channels, e, cfg)
+	}()
+}
+
+// dispatch delivers to each channel synchronously. Exported behaviour goes
+// through FireWithConfig; this is separated for testability.
+func (n *Notifier) dispatch(ctx context.Context, channels []string, e Event, cfg ChannelConfig) {
 	for _, ch := range channels {
 		switch ch {
 		case "webhook":
-			n.post(ctx, n.webhookURL, n.genericBody(e), "webhook")
+			n.post(ctx, firstNonEmpty(cfg.WebhookURL, n.webhookURL), n.genericBody(e), "webhook")
 		case "slack":
-			n.post(ctx, n.slackURL, n.slackBody(e), "slack")
+			n.post(ctx, firstNonEmpty(cfg.SlackWebhookURL, n.slackURL), n.slackBody(e), "slack")
 		case "email":
-			// Email delivery requires an SMTP/provider integration that is out
-			// of scope for the MVP; the event is still persisted to history.
-			n.logger.Info("alert fired (email channel: recorded to history only)",
-				zap.String("alert", e.AlertName), zap.String("trace_id", e.TraceID))
+			n.sendEmail(cfg.EmailTo, e)
 		default:
 			n.logger.Debug("unknown alert channel", zap.String("channel", ch))
 		}
@@ -81,12 +150,53 @@ func (n *Notifier) slackBody(e Event) []byte {
 	return b
 }
 
-func (n *Notifier) post(ctx context.Context, url string, body []byte, channel string) {
-	if url == "" {
+func (n *Notifier) sendEmail(to string, e Event) {
+	if to == "" {
+		n.logger.Debug("alert email: no recipient configured")
+		return
+	}
+	if n.smtpHost == "" || n.smtpPort == "" {
+		n.logger.Info("alert fired (email channel: SMTP not configured, event recorded only)",
+			zap.String("alert", e.AlertName), zap.String("trace_id", e.TraceID))
+		return
+	}
+
+	subject := fmt.Sprintf("[Splyntra] Alert: %s — %s (score %d)", e.AlertName, e.Severity, e.RiskScore)
+	body := fmt.Sprintf(
+		"Alert: %s\nSeverity: %s\nRisk Score: %d\nTrace ID: %s\nProject: %s\n\nView trace: %s/traces/%s",
+		e.AlertName, e.Severity, e.RiskScore, e.TraceID, e.ProjectID, n.appURL, e.TraceID,
+	)
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s",
+		n.smtpFrom, to, subject, body)
+
+	addr := n.smtpHost + ":" + n.smtpPort
+	var auth smtp.Auth
+	if n.smtpUser != "" {
+		auth = smtp.PlainAuth("", n.smtpUser, n.smtpPass, n.smtpHost)
+	}
+	recipients := strings.Split(to, ",")
+	for i := range recipients {
+		recipients[i] = strings.TrimSpace(recipients[i])
+	}
+	if err := smtp.SendMail(addr, auth, n.smtpFrom, recipients, []byte(msg)); err != nil {
+		n.logger.Warn("alert email delivery failed",
+			zap.String("alert", e.AlertName), zap.String("to", to), zap.Error(err))
+		return
+	}
+	n.logger.Info("alert email sent", zap.String("alert", e.AlertName), zap.String("to", to))
+}
+
+func (n *Notifier) post(ctx context.Context, rawURL string, body []byte, channel string) {
+	if rawURL == "" {
 		n.logger.Debug("alert channel not configured", zap.String("channel", channel))
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if !n.allowPrivate && !safeURL(rawURL) {
+		n.logger.Warn("alert delivery blocked: destination failed SSRF check (set ALERT_ALLOW_PRIVATE_WEBHOOKS=true to permit private hosts)",
+			zap.String("channel", channel), zap.String("url", rawURL))
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
 	if err != nil {
 		n.logger.Warn("build alert request failed", zap.String("channel", channel), zap.Error(err))
 		return
@@ -101,4 +211,45 @@ func (n *Notifier) post(ctx context.Context, url string, body []byte, channel st
 	if resp.StatusCode >= 300 {
 		n.logger.Warn("alert delivery non-2xx", zap.String("channel", channel), zap.Int("status", resp.StatusCode))
 	}
+}
+
+// ValidateURL reports whether a webhook/Slack URL is acceptable as a delivery
+// destination — used both at alert-create time (fail fast) and at send time.
+func ValidateURL(raw string) bool { return safeURL(raw) }
+
+// safeURL guards against SSRF: only http(s), and the host must not resolve to a
+// loopback, private, link-local, or unspecified address (blocks 127.0.0.1,
+// 10/8, 192.168/16, 169.254.169.254 cloud metadata, ::1, etc.).
+func safeURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return false
+		}
+	}
+	return true
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

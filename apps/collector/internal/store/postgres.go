@@ -130,21 +130,24 @@ func (s *PostgresStore) AgentMetaByID(ctx context.Context, orgID, projectID stri
 
 // Project is a project row scoped to an organization.
 type Project struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Slug        string    `json:"slug"`
-	Environment string    `json:"environment"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Slug        string     `json:"slug"`
+	Environment string     `json:"environment"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ArchivedAt  *time.Time `json:"archived_at"`
 }
 
-// ListProjects returns all projects for an organization.
+// ListProjects returns all projects for an organization (including archived,
+// so the UI can show and unarchive them).
 func (s *PostgresStore) ListProjects(ctx context.Context, orgID string) ([]Project, error) {
 	if s == nil || s.db == nil || !uuidRe.MatchString(orgID) {
 		return []Project{}, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id::text, name, slug, environment, created_at
-		FROM projects WHERE org_id = $1 ORDER BY created_at ASC
+		SELECT id::text, name, slug, environment, created_at, archived_at
+		FROM projects WHERE org_id = $1
+		ORDER BY archived_at IS NOT NULL, created_at ASC
 	`, orgID)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
@@ -153,12 +156,83 @@ func (s *PostgresStore) ListProjects(ctx context.Context, orgID string) ([]Proje
 	var out []Project
 	for rows.Next() {
 		var p Project
-		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Environment, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Environment, &p.CreatedAt, &p.ArchivedAt); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// RenameProject updates a project's display name (the slug is immutable so
+// existing key/data references stay valid). Scoped to the org.
+func (s *PostgresStore) RenameProject(ctx context.Context, orgID, projectID, name string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	if !uuidRe.MatchString(projectID) || !uuidRe.MatchString(orgID) {
+		return sql.ErrNoRows
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET name = $1, updated_at = NOW() WHERE id = $2 AND org_id = $3`,
+		name, projectID, orgID)
+	if err != nil {
+		return fmt.Errorf("rename project: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// SetProjectArchived archives (or restores) a project. Archiving is reversible
+// and preserves all data. Scoped to the org.
+func (s *PostgresStore) SetProjectArchived(ctx context.Context, orgID, projectID string, archived bool) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	if !uuidRe.MatchString(projectID) || !uuidRe.MatchString(orgID) {
+		return sql.ErrNoRows
+	}
+	var res sql.Result
+	var err error
+	if archived {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE projects SET archived_at = NOW(), updated_at = NOW() WHERE id = $1 AND org_id = $2`,
+			projectID, orgID)
+	} else {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE projects SET archived_at = NULL, updated_at = NOW() WHERE id = $1 AND org_id = $2`,
+			projectID, orgID)
+	}
+	if err != nil {
+		return fmt.Errorf("archive project: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteProject hard-deletes a project row (Postgres FK cascades remove its
+// agents, alerts, keys→null, etc.). ClickHouse trace data is purged separately
+// by the caller. Scoped to the org.
+func (s *PostgresStore) DeleteProject(ctx context.Context, orgID, projectID string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	if !uuidRe.MatchString(projectID) || !uuidRe.MatchString(orgID) {
+		return sql.ErrNoRows
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM projects WHERE id = $1 AND org_id = $2`, projectID, orgID)
+	if err != nil {
+		return fmt.Errorf("delete project: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // CreateProject inserts a project scoped to an org and returns the new row.
@@ -419,6 +493,9 @@ func (s *PostgresStore) DeleteAlert(ctx context.Context, orgID, alertID string) 
 	if s == nil || s.db == nil {
 		return fmt.Errorf("metadata store unavailable")
 	}
+	if !uuidRe.MatchString(alertID) {
+		return sql.ErrNoRows
+	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM alerts WHERE id = $1 AND org_id = $2`, alertID, orgID)
 	if err != nil {
 		return fmt.Errorf("delete alert: %w", err)
@@ -429,14 +506,75 @@ func (s *PostgresStore) DeleteAlert(ctx context.Context, orgID, alertID string) 
 	return nil
 }
 
+// AlertUpdate carries the mutable fields of an alert. Nil fields are left
+// unchanged, so the same call powers a full edit and a single-field toggle
+// (e.g. pausing via IsActive only).
+type AlertUpdate struct {
+	Name     *string
+	Config   json.RawMessage // nil = unchanged
+	Channels *[]string
+	IsActive *bool
+}
+
+// UpdateAlert applies a partial update to an alert, scoped to the org. Returns
+// sql.ErrNoRows if no alert with that id exists for the org.
+func (s *PostgresStore) UpdateAlert(ctx context.Context, orgID, alertID string, u AlertUpdate) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	if !uuidRe.MatchString(alertID) || !uuidRe.MatchString(orgID) {
+		return sql.ErrNoRows
+	}
+	sets := []string{}
+	args := []any{}
+	i := 1
+	if u.Name != nil {
+		sets = append(sets, fmt.Sprintf("name = $%d", i))
+		args = append(args, *u.Name)
+		i++
+	}
+	if u.Config != nil {
+		sets = append(sets, fmt.Sprintf("config = $%d", i))
+		args = append(args, []byte(u.Config))
+		i++
+	}
+	if u.Channels != nil {
+		sets = append(sets, fmt.Sprintf("channels = $%d", i))
+		args = append(args, pq.StringArray(*u.Channels))
+		i++
+	}
+	if u.IsActive != nil {
+		sets = append(sets, fmt.Sprintf("is_active = $%d", i))
+		args = append(args, *u.IsActive)
+		i++
+	}
+	if len(sets) == 0 {
+		return nil // nothing to change
+	}
+	q := fmt.Sprintf("UPDATE alerts SET %s WHERE id = $%d AND org_id = $%d",
+		strings.Join(sets, ", "), i, i+1)
+	args = append(args, alertID, orgID)
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("update alert: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // RiskAlert is a risk_threshold alert reduced to what evaluation needs.
 type RiskAlert struct {
-	ID        string
-	OrgID     string
-	ProjectID string
-	Name      string
-	Threshold int
-	Channels  []string
+	ID              string
+	OrgID           string
+	ProjectID       string
+	Name            string
+	Threshold       int
+	Channels        []string
+	WebhookURL      string
+	SlackWebhookURL string
+	EmailTo         string
 }
 
 // ActiveRiskAlerts returns active risk_threshold alerts applicable to a project
@@ -448,7 +586,10 @@ func (s *PostgresStore) ActiveRiskAlerts(ctx context.Context, orgID, projectID s
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id::text, COALESCE(project_id::text,''), name,
-		       COALESCE((config->>'threshold')::int, 50), channels
+		       COALESCE((config->>'threshold')::int, 50), channels,
+		       COALESCE(config->>'webhook_url',''),
+		       COALESCE(config->>'slack_webhook_url',''),
+		       COALESCE(config->>'email_to','')
 		FROM alerts
 		WHERE org_id = $1 AND is_active = TRUE AND type = 'risk_threshold'
 		  AND (project_id IS NULL OR project_id = $2)
@@ -461,7 +602,7 @@ func (s *PostgresStore) ActiveRiskAlerts(ctx context.Context, orgID, projectID s
 	for rows.Next() {
 		var a RiskAlert
 		var channels pq.StringArray
-		if err := rows.Scan(&a.ID, &a.ProjectID, &a.Name, &a.Threshold, &channels); err != nil {
+		if err := rows.Scan(&a.ID, &a.ProjectID, &a.Name, &a.Threshold, &channels, &a.WebhookURL, &a.SlackWebhookURL, &a.EmailTo); err != nil {
 			return nil, fmt.Errorf("scan risk alert: %w", err)
 		}
 		a.OrgID = orgID
@@ -473,17 +614,66 @@ func (s *PostgresStore) ActiveRiskAlerts(ctx context.Context, orgID, projectID s
 
 // CostAlert is an active cost_threshold alert reduced to what evaluation needs.
 type CostAlert struct {
-	ID        string
-	OrgID     string
-	ProjectID string
-	Name      string
-	Threshold float64
-	WindowSec int
-	Channels  []string
+	ID              string
+	OrgID           string
+	ProjectID       string
+	Name            string
+	Threshold       float64
+	WindowSec       int
+	Channels        []string
+	WebhookURL      string
+	SlackWebhookURL string
+	EmailTo         string
 }
 
 // AllActiveCostAlerts returns every active cost_threshold alert across tenants,
 // for the periodic spend evaluator. config: {"threshold": <usd>, "window_sec": <s>}.
+// SpendAnomalyAlert is an active spend_anomaly alert (config: window_days, factor).
+type SpendAnomalyAlert struct {
+	ID              string
+	OrgID           string
+	ProjectID       string
+	Name            string
+	WindowDays      int
+	Factor          float64
+	Channels        []string
+	WebhookURL      string
+	SlackWebhookURL string
+	EmailTo         string
+}
+
+// AllActiveSpendAnomalyAlerts returns active spend_anomaly alerts across tenants,
+// for the periodic anomaly evaluator. config: {"window_days":<n>,"factor":<x>}.
+func (s *PostgresStore) AllActiveSpendAnomalyAlerts(ctx context.Context) ([]SpendAnomalyAlert, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id::text, org_id::text, COALESCE(project_id::text,''), name,
+		       COALESCE((config->>'window_days')::int, 7),
+		       COALESCE((config->>'factor')::float8, 3), channels,
+		       COALESCE(config->>'webhook_url',''),
+		       COALESCE(config->>'slack_webhook_url',''),
+		       COALESCE(config->>'email_to','')
+		FROM alerts
+		WHERE is_active = TRUE AND type = 'spend_anomaly'`)
+	if err != nil {
+		return nil, fmt.Errorf("all spend anomaly alerts: %w", err)
+	}
+	defer rows.Close()
+	var out []SpendAnomalyAlert
+	for rows.Next() {
+		var a SpendAnomalyAlert
+		var channels pq.StringArray
+		if err := rows.Scan(&a.ID, &a.OrgID, &a.ProjectID, &a.Name, &a.WindowDays, &a.Factor, &channels, &a.WebhookURL, &a.SlackWebhookURL, &a.EmailTo); err != nil {
+			return nil, fmt.Errorf("scan spend anomaly alert: %w", err)
+		}
+		a.Channels = channels
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) AllActiveCostAlerts(ctx context.Context) ([]CostAlert, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
@@ -491,7 +681,10 @@ func (s *PostgresStore) AllActiveCostAlerts(ctx context.Context) ([]CostAlert, e
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id::text, org_id::text, COALESCE(project_id::text,''), name,
 		       COALESCE((config->>'threshold')::float8, 0),
-		       COALESCE((config->>'window_sec')::int, 86400), channels
+		       COALESCE((config->>'window_sec')::int, 86400), channels,
+		       COALESCE(config->>'webhook_url',''),
+		       COALESCE(config->>'slack_webhook_url',''),
+		       COALESCE(config->>'email_to','')
 		FROM alerts
 		WHERE is_active = TRUE AND type = 'cost_threshold'`)
 	if err != nil {
@@ -502,7 +695,7 @@ func (s *PostgresStore) AllActiveCostAlerts(ctx context.Context) ([]CostAlert, e
 	for rows.Next() {
 		var a CostAlert
 		var channels pq.StringArray
-		if err := rows.Scan(&a.ID, &a.OrgID, &a.ProjectID, &a.Name, &a.Threshold, &a.WindowSec, &channels); err != nil {
+		if err := rows.Scan(&a.ID, &a.OrgID, &a.ProjectID, &a.Name, &a.Threshold, &a.WindowSec, &channels, &a.WebhookURL, &a.SlackWebhookURL, &a.EmailTo); err != nil {
 			return nil, fmt.Errorf("scan cost alert: %w", err)
 		}
 		a.Channels = channels
@@ -587,6 +780,173 @@ func (s *PostgresStore) ListAlertEvents(ctx context.Context, orgID, projectID st
 func nullableUUID(s string) any {
 	if uuidRe.MatchString(s) {
 		return s
+	}
+	return nil
+}
+
+// ─── Model prices (externalized, hot-reloadable) ────────────────────────────
+
+// ModelPriceRow is a price-table row for the admin API.
+type ModelPriceRow struct {
+	Model           string    `json:"model"`
+	PromptPer1K     float64   `json:"prompt_per_1k"`
+	CompletionPer1K float64   `json:"completion_per_1k"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+// LoadModelPrices loads the full price table for the collector's in-memory cache.
+func (s *PostgresStore) LoadModelPrices(ctx context.Context) (map[string]ModelPrice, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT model, prompt_per_1k, completion_per_1k FROM model_prices`)
+	if err != nil {
+		return nil, fmt.Errorf("load model prices: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]ModelPrice{}
+	for rows.Next() {
+		var m string
+		var p, c float64
+		if err := rows.Scan(&m, &p, &c); err != nil {
+			return nil, fmt.Errorf("scan model price: %w", err)
+		}
+		out[m] = ModelPrice{PromptPer1K: p, CompletionPer1K: c}
+	}
+	return out, rows.Err()
+}
+
+// ListModelPrices returns the price table for display in the admin UI.
+func (s *PostgresStore) ListModelPrices(ctx context.Context) ([]ModelPriceRow, error) {
+	if s == nil || s.db == nil {
+		return []ModelPriceRow{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT model, prompt_per_1k, completion_per_1k, updated_at FROM model_prices ORDER BY model ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list model prices: %w", err)
+	}
+	defer rows.Close()
+	out := []ModelPriceRow{}
+	for rows.Next() {
+		var r ModelPriceRow
+		if err := rows.Scan(&r.Model, &r.PromptPer1K, &r.CompletionPer1K, &r.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan model price row: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UpsertModelPrice inserts or updates a model's pricing.
+func (s *PostgresStore) UpsertModelPrice(ctx context.Context, model string, promptPer1K, completionPer1K float64) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO model_prices (model, prompt_per_1k, completion_per_1k, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (model) DO UPDATE
+		SET prompt_per_1k = EXCLUDED.prompt_per_1k,
+		    completion_per_1k = EXCLUDED.completion_per_1k,
+		    updated_at = NOW()`,
+		model, promptPer1K, completionPer1K)
+	if err != nil {
+		return fmt.Errorf("upsert model price: %w", err)
+	}
+	return nil
+}
+
+// DeleteModelPrice removes a model from the price table.
+func (s *PostgresStore) DeleteModelPrice(ctx context.Context, model string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM model_prices WHERE model = $1`, model)
+	if err != nil {
+		return fmt.Errorf("delete model price: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ─── Budgets ─────────────────────────────────────────────────────────────────
+
+// Budget is a per-project (or org-wide) monthly spend budget.
+type Budget struct {
+	ID              string  `json:"id"`
+	ProjectID       string  `json:"project_id"`
+	MonthlyLimitUSD float64 `json:"monthly_limit_usd"`
+}
+
+// ListBudgets returns all budgets for an org.
+func (s *PostgresStore) ListBudgets(ctx context.Context, orgID string) ([]Budget, error) {
+	if s == nil || s.db == nil || !uuidRe.MatchString(orgID) {
+		return []Budget{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id::text, COALESCE(project_id::text, ''), monthly_limit_usd FROM budgets WHERE org_id = $1`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("list budgets: %w", err)
+	}
+	defer rows.Close()
+	out := []Budget{}
+	for rows.Next() {
+		var b Budget
+		if err := rows.Scan(&b.ID, &b.ProjectID, &b.MonthlyLimitUSD); err != nil {
+			return nil, fmt.Errorf("scan budget: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// UpsertBudget sets the monthly budget for a project (nil projectID = org-wide).
+func (s *PostgresStore) UpsertBudget(ctx context.Context, orgID string, projectID *string, limitUSD float64) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	var res sql.Result
+	var err error
+	if projectID == nil {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE budgets SET monthly_limit_usd = $1, updated_at = NOW() WHERE org_id = $2 AND project_id IS NULL`,
+			limitUSD, orgID)
+	} else {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE budgets SET monthly_limit_usd = $1, updated_at = NOW() WHERE org_id = $2 AND project_id = $3`,
+			limitUSD, orgID, *projectID)
+	}
+	if err != nil {
+		return fmt.Errorf("update budget: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO budgets (org_id, project_id, monthly_limit_usd) VALUES ($1, $2, $3)`,
+		orgID, projectID, limitUSD)
+	if err != nil {
+		return fmt.Errorf("insert budget: %w", err)
+	}
+	return nil
+}
+
+// DeleteBudget removes a budget, scoped to the org.
+func (s *PostgresStore) DeleteBudget(ctx context.Context, orgID, id string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("metadata store unavailable")
+	}
+	if !uuidRe.MatchString(id) {
+		return sql.ErrNoRows
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM budgets WHERE id = $1 AND org_id = $2`, id, orgID)
+	if err != nil {
+		return fmt.Errorf("delete budget: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
 	}
 	return nil
 }

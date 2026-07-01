@@ -39,6 +39,10 @@ secrets:
   clickhousePassword: splyntra
   clickhouseDb: splyntra
   nextauthSecret: "change-me-in-production"
+  # Shared trusted-channel token for the dashboard BFF → collector/evaluation.
+  # REQUIRED for multi-tenant cloud (enables per-org X-Splyntra-Org-Id scoping);
+  # leave blank for single-tenant self-host.
+  collectorServiceToken: ""
   # Optional alert delivery destinations consumed by the collector notifier.
   alertWebhookUrl: ""
   alertSlackWebhookUrl: ""

@@ -350,7 +350,7 @@ export function wrapLLM<T extends (...args: any[]) => any>(fn: T, model: string,
   );
 }
 
-export { instrument, instrumentOpenAI, instrumentLangGraph } from "./instrumentors";
+export { instrument, instrumentOpenAI, instrumentLangGraph, instrumentCrewAI, instrumentOpenAIAgents } from "./instrumentors";
 export { RedactingSpanProcessor, redactString } from "./redaction";
 export { makeOtlpExporter } from "./exporters";
 export { trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";

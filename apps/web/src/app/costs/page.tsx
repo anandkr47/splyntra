@@ -2,15 +2,18 @@
 "use client";
 
 import { useCosts } from "@/lib/hooks";
-import { CostModelItem, ProjectCostItem } from "@/lib/api";
+import { CostModelItem, ProjectCostItem, WorkflowCostItem } from "@/lib/api";
 import { DollarSign, Coins, Hash, Calculator } from "lucide-react";
 import { PageHeader, StatCard } from "@/components/ui/primitives";
+import { BudgetsSection } from "./BudgetsSection";
+import { PricingEditor } from "./PricingEditor";
 
 export default function CostsPage() {
   const { data, isLoading, error } = useCosts();
 
   const models: CostModelItem[] = data?.models || [];
   const byProject: ProjectCostItem[] = data?.by_project || [];
+  const byWorkflow: WorkflowCostItem[] = data?.by_workflow || [];
   const summary = data?.summary || { total_cost: 0, total_calls: 0, total_tokens: 0, avg_cost_per_call: 0 };
   const hasRealData = !error && models.length > 0;
 
@@ -36,6 +39,9 @@ export default function CostsPage() {
         <StatCard label="Avg Cost/Call" value={`$${avgCostPerCall.toFixed(4)}`} icon={Calculator} />
       </div>
 
+      {/* Budgets + forecasting */}
+      <BudgetsSection />
+
       {/* Per-project breakdown */}
       {byProject.length > 0 && (
         <div className="mb-6">
@@ -54,6 +60,31 @@ export default function CostsPage() {
                 <div className="text-xl font-bold mt-1">${p.total_cost.toFixed(4)}</div>
                 <div className="text-xs text-gray-500 mt-1">
                   {p.call_count.toLocaleString()} calls · {p.total_tokens.toLocaleString()} tokens
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Per-workflow breakdown */}
+      {byWorkflow.length > 0 && (
+        <div className="mb-6">
+          <h2 className="text-sm font-semibold mb-3 text-gray-700 dark:text-gray-300">
+            Cost by Workflow
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {byWorkflow.map((wf) => (
+              <div
+                key={wf.workflow_id}
+                className="rounded-xl border border-gray-200/80 bg-white p-5 shadow-card dark:border-gray-800 dark:bg-gray-900"
+              >
+                <div className="truncate text-xs font-medium font-mono" title={wf.workflow_id}>
+                  {wf.workflow_id}
+                </div>
+                <div className="mt-1 text-xl font-bold">${wf.total_cost.toFixed(4)}</div>
+                <div className="mt-1 text-xs text-gray-500">
+                  {wf.call_count.toLocaleString()} runs · {wf.total_tokens.toLocaleString()} tokens
                 </div>
               </div>
             ))}
@@ -150,6 +181,9 @@ export default function CostsPage() {
           </table>
         )}
       </div>
+
+      {/* Unpriced-model callout + model price editor (admin) */}
+      <PricingEditor />
     </div>
   );
 }

@@ -5,7 +5,8 @@ import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { signIn } from "next-auth/react";
-import { AuthCard, Field } from "@/components/auth/AuthCard";
+import { AuthLayout, Field } from "@/components/auth/AuthLayout";
+import { OAuthButtons } from "@/components/auth/OAuthButtons";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -28,25 +29,42 @@ export default function LoginPage() {
   }
 
   return (
-    <AuthCard title="Sign in to Splyntra">
+    <AuthLayout
+      title="Welcome back"
+      subtitle="Sign in to your account"
+      footer={
+        <>
+          Don&rsquo;t have an account?{" "}
+          <Link href="/signup" className="font-medium text-zinc-900 underline-offset-2 hover:underline dark:text-white">
+            Sign up
+          </Link>
+        </>
+      }
+    >
+      <OAuthButtons />
       <form onSubmit={onSubmit} className="space-y-4">
-        <Field name="email" type="email" label="Email" />
-        <Field name="password" type="password" label="Password" />
-        {error && <p className="text-sm text-red-600">{error}</p>}
+        <Field name="email" type="email" label="Email" autoComplete="email" />
+        <div>
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[13px] font-medium text-zinc-700 dark:text-zinc-300">Password</span>
+          </div>
+          <input
+            name="password"
+            type="password"
+            autoComplete="current-password"
+            required
+            className="w-full rounded-lg border border-zinc-200 bg-white px-3.5 py-2.5 text-[14px] text-zinc-900 outline-none transition-colors placeholder:text-zinc-400 focus:border-zinc-900 focus:ring-4 focus:ring-zinc-900/10 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white dark:focus:border-zinc-100 dark:focus:ring-zinc-100/10"
+          />
+        </div>
+        {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
         <button
           type="submit"
           disabled={busy}
-          className="w-full rounded-xl bg-gradient-to-r from-splyntra-600 to-splyntra-500 py-2.5 text-sm font-semibold text-white shadow-md shadow-splyntra-500/20 transition-all hover:from-splyntra-700 hover:to-splyntra-600 hover:shadow-lg hover:shadow-splyntra-500/30 disabled:opacity-50"
+          className="w-full rounded-lg bg-zinc-900 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200"
         >
           {busy ? "Signing in…" : "Sign in"}
         </button>
       </form>
-      <p className="mt-5 text-center text-[13px] text-gray-500">
-        No account?{" "}
-        <Link href="/signup" className="font-medium text-splyntra-600 hover:text-splyntra-700 hover:underline">
-          Create one
-        </Link>
-      </p>
-    </AuthCard>
+    </AuthLayout>
   );
 }

@@ -52,6 +52,40 @@ def tool_call_success(item: Item) -> float:
     return hits / len(expected)
 
 
+def _tokens(v) -> set:
+    return set(_s(v).strip().lower().split())
+
+
+def precision_token_overlap(item: Item) -> float:
+    """Token precision: fraction of the actual output's tokens that appear in the
+    expected output. Empty actual → 1.0 (vacuously precise)."""
+    expected, actual = _tokens(item.get("expected")), _tokens(item.get("actual"))
+    if not actual:
+        return 1.0
+    return len(expected & actual) / len(actual)
+
+
+def recall_token_overlap(item: Item) -> float:
+    """Token recall: fraction of the expected output's tokens present in the
+    actual output. Empty expected → 1.0 (nothing required)."""
+    expected, actual = _tokens(item.get("expected")), _tokens(item.get("actual"))
+    if not expected:
+        return 1.0
+    return len(expected & actual) / len(expected)
+
+
+def tool_call_precision(item: Item) -> float:
+    """Precision of tool calls: fraction of the actual tool calls that were
+    expected (complements tool_call_success, which is recall). Empty actual → 1.0."""
+    expected = item.get("expected_tool_calls") or []
+    actual = item.get("tool_calls") or []
+    if not isinstance(actual, list) or not actual:
+        return 1.0
+    expected_set = {str(e) for e in expected} if isinstance(expected, list) else set()
+    hits = sum(1 for a in actual if str(a) in expected_set)
+    return hits / len(actual)
+
+
 def latency(item: Item) -> float:
     """1.0 if under the threshold (default 5000ms), linearly degrading to 0 at 4x."""
     ms = float(item.get("latency_ms") or 0)
@@ -75,6 +109,9 @@ SCORERS: Dict[str, Callable[[Item], float]] = {
     "exact_match": exact_match,
     "rule_based": rule_based,
     "tool_call_success": tool_call_success,
+    "tool_call_precision": tool_call_precision,
+    "precision_token_overlap": precision_token_overlap,
+    "recall_token_overlap": recall_token_overlap,
     "latency": latency,
     "cost": cost,
 }

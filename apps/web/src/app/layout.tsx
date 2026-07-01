@@ -7,7 +7,8 @@ import { AppShell } from "@/components/layout/AppShell";
 export const metadata: Metadata = {
   title: "Splyntra — Agent Observability & Security",
   description: "Unified observability and security for AI agents",
-  icons: { icon: "/logo.png", apple: "/logo.png", shortcut: "/logo.png" },
+  // Favicon + apple-touch icon are served from app/icon.png and app/apple-icon.png
+  // (Next's metadata file convention) — optimized 64/180px, not the 712KB logo.
   manifest: "/manifest.json",
 };
 

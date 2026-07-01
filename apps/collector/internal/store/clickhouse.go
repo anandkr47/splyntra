@@ -3,8 +3,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -14,8 +18,10 @@ import (
 	"github.com/splyntra/splyntra/apps/collector/internal/streaming"
 )
 
+type modelPrice struct{ promptPer1K, completionPer1K float64 }
+
 // LLM cost table (USD per 1K tokens) - updated pricing as of 2024
-var modelCosts = map[string]struct{ promptPer1K, completionPer1K float64 }{
+var modelCosts = map[string]modelPrice{
 	"gpt-4":             {0.03, 0.06},
 	"gpt-4-turbo":       {0.01, 0.03},
 	"gpt-4o":            {0.005, 0.015},
@@ -34,24 +40,105 @@ var modelCosts = map[string]struct{ promptPer1K, completionPer1K float64 }{
 	"mistral-small":     {0.001, 0.003},
 }
 
-// ComputeCost calculates the USD cost for a span based on model and tokens.
-func ComputeCost(model string, promptTokens, completionTokens uint32) float64 {
-	pricing, ok := modelCosts[model]
-	if !ok {
-		// Try partial match for versioned model names (e.g., "gpt-4o-2024-05-13")
-		for prefix, p := range modelCosts {
-			if len(model) > len(prefix) && model[:len(prefix)] == prefix {
-				pricing = p
-				ok = true
-				break
-			}
+// sortedModelPrefixes holds the price-table keys sorted longest-first so that
+// prefix matching of versioned model names is DETERMINISTIC (a Go map iterates
+// in random order, which previously made "gpt-4o-2024-05-13" bind to either
+// "gpt-4o" or "gpt-4" depending on the run). Longest-prefix wins.
+// ModelPrice is the exported per-1K-token pricing used when loading the price
+// table from Postgres (see SetModelPrices).
+type ModelPrice struct {
+	PromptPer1K     float64
+	CompletionPer1K float64
+}
+
+// priceTable is the active price map plus its keys sorted longest-first for
+// deterministic longest-prefix matching. Swapped atomically on reload.
+type priceTable struct {
+	prices   map[string]modelPrice
+	prefixes []string
+}
+
+var activePrices atomic.Value // *priceTable
+
+// unpricedModels dedupes the "unpriced model" warning so we log each unknown
+// model once instead of on every span.
+var unpricedModels sync.Map
+
+func init() {
+	setPriceTable(modelCosts) // seed with the built-in defaults
+}
+
+func setPriceTable(m map[string]modelPrice) {
+	prefixes := make([]string, 0, len(m))
+	for k := range m {
+		prefixes = append(prefixes, k)
+	}
+	sort.Slice(prefixes, func(i, j int) bool {
+		if len(prefixes[i]) != len(prefixes[j]) {
+			return len(prefixes[i]) > len(prefixes[j])
 		}
-		if !ok {
-			return 0
+		return prefixes[i] < prefixes[j]
+	})
+	activePrices.Store(&priceTable{prices: m, prefixes: prefixes})
+}
+
+// SetModelPrices replaces the active price table (called by the collector after
+// loading model_prices from Postgres, and on periodic refresh). An empty map is
+// ignored so a transient DB failure keeps the last-known/built-in prices.
+func SetModelPrices(prices map[string]ModelPrice) {
+	if len(prices) == 0 {
+		return
+	}
+	m := make(map[string]modelPrice, len(prices))
+	for k, v := range prices {
+		m[k] = modelPrice{v.PromptPer1K, v.CompletionPer1K}
+	}
+	setPriceTable(m)
+}
+
+// UnpricedModels returns the distinct model names seen at ingest that had no
+// price-table entry (so their cost was recorded as $0). Surfaced by the pricing
+// admin API so operators can see + fix understated spend.
+func UnpricedModels() []string {
+	var out []string
+	unpricedModels.Range(func(k, _ any) bool {
+		if s, ok := k.(string); ok {
+			out = append(out, s)
+		}
+		return true
+	})
+	sort.Strings(out)
+	return out
+}
+
+// lookupModelPrice resolves a model's pricing: exact match first, then a
+// deterministic longest-prefix match for versioned names. Returns false when the
+// model is not in the price table (caller records $0 and should surface it).
+func lookupModelPrice(model string) (modelPrice, bool) {
+	pt, _ := activePrices.Load().(*priceTable)
+	if pt == nil {
+		return modelPrice{}, false
+	}
+	if p, ok := pt.prices[model]; ok {
+		return p, true
+	}
+	for _, prefix := range pt.prefixes {
+		if strings.HasPrefix(model, prefix) {
+			return pt.prices[prefix], true
 		}
 	}
-	return (float64(promptTokens)/1000)*pricing.promptPer1K +
-		(float64(completionTokens)/1000)*pricing.completionPer1K
+	return modelPrice{}, false
+}
+
+// ComputeCost calculates the USD cost for a span based on model and tokens.
+// Unknown models cost $0 (surfaced via a one-time warning in InsertSpan).
+func ComputeCost(model string, promptTokens, completionTokens uint32) float64 {
+	p, ok := lookupModelPrice(model)
+	if !ok {
+		return 0
+	}
+	return (float64(promptTokens)/1000)*p.promptPer1K +
+		(float64(completionTokens)/1000)*p.completionPer1K
 }
 
 // ClickHouseStore handles writing and querying trace data.
@@ -242,8 +329,15 @@ func (s *ClickHouseStore) flushTraces(traces []*streaming.TraceEvent) {
 
 // InsertSpan buffers a span for batch insertion.
 func (s *ClickHouseStore) InsertSpan(ctx context.Context, span *streaming.SpanEvent) error {
-	// Compute cost before buffering
+	// Compute cost before buffering. Warn once per unknown model so silent $0
+	// pricing (understated spend) is visible in the logs instead of hidden.
 	if span.Model != "" && span.CostUSD == 0 {
+		if _, priced := lookupModelPrice(span.Model); !priced {
+			if _, seen := unpricedModels.LoadOrStore(span.Model, true); !seen {
+				s.logger.Warn("unpriced model — cost recorded as $0; add it to the price table",
+					zap.String("model", span.Model))
+			}
+		}
 		span.CostUSD = ComputeCost(span.Model, span.PromptTokens, span.CompletionTokens)
 	}
 
@@ -303,24 +397,68 @@ type Detection struct {
 }
 
 // QueryTraces returns recent traces for a project.
-func (s *ClickHouseStore) QueryTraces(ctx context.Context, orgID, projectID string, limit int) ([]TraceRow, error) {
+// TraceFilter carries list filters + pagination for QueryTraces. Zero values
+// mean "no filter". MinRisk filters on risk_score (>=); SinceSec bounds to the
+// trailing window.
+type TraceFilter struct {
+	Limit    int
+	Offset   int
+	AgentID  string
+	Status   string // "", "ok", "error"
+	MinRisk  int    // risk_score >= MinRisk
+	SinceSec int
+}
+
+// QueryTraces returns a page of traces matching the filter, plus the TOTAL count
+// of matches (for real pagination). All filters are applied to both queries and
+// every query is org+project scoped.
+func (s *ClickHouseStore) QueryTraces(ctx context.Context, orgID, projectID string, f TraceFilter) ([]TraceRow, uint64, error) {
+	where := "org_id = ? AND project_id = ?"
+	args := []any{orgID, projectID}
+	if f.AgentID != "" {
+		where += " AND agent_id = ?"
+		args = append(args, f.AgentID)
+	}
+	if f.Status == "ok" || f.Status == "error" {
+		where += " AND status = ?"
+		args = append(args, f.Status)
+	}
+	if f.MinRisk > 0 {
+		where += " AND risk_score >= ?"
+		args = append(args, f.MinRisk)
+	}
+	if f.SinceSec > 0 {
+		where += " AND started_at >= now() - toIntervalSecond(?)"
+		args = append(args, f.SinceSec)
+	}
+
+	var total uint64
+	if err := s.conn.QueryRow(ctx, "SELECT count() FROM traces FINAL WHERE "+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count traces: %w", err)
+	}
+
+	limit := f.Limit
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	pageArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := s.conn.Query(ctx, `
 		SELECT
 			trace_id, agent_id, workflow_id, status, latency_ms,
 			total_tokens, cost_usd, risk_score, risk_severity,
 			detection_count, span_count, started_at, completed_at
-		FROM traces
-		WHERE org_id = ? AND project_id = ?
+		FROM traces FINAL
+		WHERE `+where+`
 		ORDER BY started_at DESC
-		LIMIT ?`,
-		orgID, projectID, limit,
+		LIMIT ? OFFSET ?`,
+		pageArgs...,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("query traces: %w", err)
+		return nil, 0, fmt.Errorf("query traces: %w", err)
 	}
 	defer rows.Close()
 
@@ -332,14 +470,14 @@ func (s *ClickHouseStore) QueryTraces(ctx context.Context, orgID, projectID stri
 			&t.TotalTokens, &t.CostUSD, &t.RiskScore, &t.RiskSeverity,
 			&t.DetectionCount, &t.SpanCount, &t.StartedAt, &t.CompletedAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan trace: %w", err)
+			return nil, 0, fmt.Errorf("scan trace: %w", err)
 		}
 		traces = append(traces, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate traces: %w", err)
+		return nil, 0, fmt.Errorf("iterate traces: %w", err)
 	}
-	return traces, nil
+	return traces, total, nil
 }
 
 // QuerySpans returns all spans for a trace, scoped to a tenant.
@@ -350,9 +488,10 @@ func (s *ClickHouseStore) QuerySpans(ctx context.Context, traceID, orgID, projec
 			latency_ms, model, prompt_tokens, completion_tokens, cost_usd,
 			input_preview, output_preview,
 			attributes, started_at
-		FROM spans
+		FROM spans FINAL
 		WHERE trace_id = ? AND org_id = ? AND project_id = ?
-		ORDER BY started_at ASC`,
+		ORDER BY started_at ASC
+		LIMIT 5000`,
 		traceID, orgID, projectID,
 	)
 	if err != nil {
@@ -380,14 +519,86 @@ func (s *ClickHouseStore) QuerySpans(ctx context.Context, traceID, orgID, projec
 }
 
 // QueryDetections returns detections for a trace, scoped to a tenant.
+// IncidentFilter carries filters + pagination for the org/project-wide security
+// incidents feed. Zero values mean "no filter".
+type IncidentFilter struct {
+	Limit       int
+	Offset      int
+	Detector    string // "pii" | "secrets" | "injection"
+	MinSeverity string // "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" (>= comparison)
+	SinceSec    int
+}
+
+// QueryIncidents lists detections across all of a project's traces (the Security
+// Incidents feed), with filters + pagination, plus the total match count.
+// Severity is an Enum8 (LOW=1..CRITICAL=4), so `severity >= ?` gives a floor.
+func (s *ClickHouseStore) QueryIncidents(ctx context.Context, orgID, projectID string, f IncidentFilter) ([]DetectionRow, uint64, error) {
+	where := "org_id = ? AND project_id = ?"
+	args := []any{orgID, projectID}
+	if f.Detector != "" {
+		where += " AND detector = ?"
+		args = append(args, f.Detector)
+	}
+	if f.MinSeverity != "" {
+		where += " AND severity >= ?"
+		args = append(args, f.MinSeverity)
+	}
+	if f.SinceSec > 0 {
+		where += " AND detected_at >= now() - toIntervalSecond(?)"
+		args = append(args, f.SinceSec)
+	}
+
+	var total uint64
+	if err := s.conn.QueryRow(ctx, "SELECT count() FROM detections FINAL WHERE "+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count incidents: %w", err)
+	}
+
+	limit := f.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	pageArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := s.conn.Query(ctx, `
+		SELECT
+			trace_id, span_id, detector, category, severity,
+			confidence, description, is_beta, detected_at
+		FROM detections FINAL
+		WHERE `+where+`
+		ORDER BY detected_at DESC
+		LIMIT ? OFFSET ?`,
+		pageArgs...,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query incidents: %w", err)
+	}
+	defer rows.Close()
+	var dets []DetectionRow
+	for rows.Next() {
+		var d DetectionRow
+		if err := rows.Scan(
+			&d.TraceID, &d.SpanID, &d.Detector, &d.Category, &d.Severity,
+			&d.Confidence, &d.Description, &d.IsBeta, &d.DetectedAt,
+		); err != nil {
+			return nil, 0, fmt.Errorf("scan incident: %w", err)
+		}
+		dets = append(dets, d)
+	}
+	return dets, total, rows.Err()
+}
+
 func (s *ClickHouseStore) QueryDetections(ctx context.Context, traceID, orgID, projectID string) ([]DetectionRow, error) {
 	rows, err := s.conn.Query(ctx, `
 		SELECT
 			trace_id, span_id, detector, category, severity,
 			confidence, description, is_beta, detected_at
-		FROM detections
+		FROM detections FINAL
 		WHERE trace_id = ? AND org_id = ? AND project_id = ?
-		ORDER BY detected_at ASC`,
+		ORDER BY detected_at ASC
+		LIMIT 2000`,
 		traceID, orgID, projectID,
 	)
 	if err != nil {
@@ -473,6 +684,57 @@ func (s *ClickHouseStore) Ping(ctx context.Context) error {
 	return s.conn.Ping(ctx)
 }
 
+// QueryTraceByID returns the stored trace row (with the authoritative risk score
+// and timing), or nil if not found. The detail view uses this so its risk/agent/
+// timing match the list instead of being recomputed client-side.
+func (s *ClickHouseStore) QueryTraceByID(ctx context.Context, traceID, orgID, projectID string) (*TraceRow, error) {
+	rows, err := s.conn.Query(ctx, `
+		SELECT trace_id, agent_id, workflow_id, status, latency_ms, total_tokens,
+		       cost_usd, risk_score, risk_severity, detection_count, span_count,
+		       started_at, completed_at
+		FROM traces FINAL
+		WHERE trace_id = ? AND org_id = ? AND project_id = ?
+		LIMIT 1`,
+		traceID, orgID, projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query trace by id: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, nil
+	}
+	var t TraceRow
+	if err := rows.Scan(
+		&t.TraceID, &t.AgentID, &t.WorkflowID, &t.Status, &t.LatencyMs, &t.TotalTokens,
+		&t.CostUSD, &t.RiskScore, &t.RiskSeverity, &t.DetectionCount, &t.SpanCount,
+		&t.StartedAt, &t.CompletedAt,
+	); err != nil {
+		return nil, fmt.Errorf("scan trace: %w", err)
+	}
+	return &t, nil
+}
+
+// DeleteProjectData purges a project's rows from every ClickHouse table. Uses
+// ALTER TABLE ... DELETE (async mutations); errors on individual tables are
+// returned joined so the caller can log a partial purge. Always filters on both
+// org_id and project_id for tenant safety.
+func (s *ClickHouseStore) DeleteProjectData(ctx context.Context, orgID, projectID string) error {
+	if s == nil || s.conn == nil {
+		return nil
+	}
+	tables := []string{"traces", "spans", "detections", "cost_daily_mv"}
+	var errs []error
+	for _, t := range tables {
+		// #nosec G201 — table name is from a fixed internal allowlist above.
+		q := "ALTER TABLE " + t + " DELETE WHERE org_id = ? AND project_id = ?"
+		if err := s.conn.Exec(ctx, q, orgID, projectID); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", t, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // ─── Agent and Cost Queries ─────────────────────────────────────────────────
 
 // AgentRow represents aggregated agent stats.
@@ -485,11 +747,19 @@ type AgentRow struct {
 	TotalTokens    uint64    `json:"total_tokens"`
 	TotalCost      float64   `json:"total_cost"`
 	DetectionCount uint64    `json:"detection_count"`
+	AvgRisk        float64   `json:"avg_risk"`
 	LastSeenAt     time.Time `json:"last_seen_at"`
 }
 
-// QueryAgents returns aggregated agent stats for a project.
-func (s *ClickHouseStore) QueryAgents(ctx context.Context, orgID, projectID string) ([]AgentRow, error) {
+// QueryAgents returns aggregated agent stats for a project. windowSec > 0 bounds
+// the aggregation to the trailing window; 0 means all-time.
+func (s *ClickHouseStore) QueryAgents(ctx context.Context, orgID, projectID string, windowSec int) ([]AgentRow, error) {
+	where := "org_id = ? AND project_id = ?"
+	args := []any{orgID, projectID}
+	if windowSec > 0 {
+		where += " AND started_at >= now() - toIntervalSecond(?)"
+		args = append(args, windowSec)
+	}
 	rows, err := s.conn.Query(ctx, `
 		SELECT
 			agent_id,
@@ -500,13 +770,14 @@ func (s *ClickHouseStore) QueryAgents(ctx context.Context, orgID, projectID stri
 			sum(total_tokens) AS total_tokens,
 			sum(cost_usd) AS total_cost,
 			sum(detection_count) AS detection_count,
+			avg(risk_score) AS avg_risk,
 			max(started_at) AS last_seen_at
-		FROM traces
-		WHERE org_id = ? AND project_id = ?
+		FROM traces FINAL
+		WHERE `+where+`
 		GROUP BY agent_id
 		ORDER BY trace_count DESC
 		LIMIT 100`,
-		orgID, projectID,
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query agents: %w", err)
@@ -519,7 +790,7 @@ func (s *ClickHouseStore) QueryAgents(ctx context.Context, orgID, projectID stri
 		if err := rows.Scan(
 			&a.AgentID, &a.TraceCount, &a.ErrorCount,
 			&a.AvgLatencyMs, &a.P95LatencyMs,
-			&a.TotalTokens, &a.TotalCost, &a.DetectionCount, &a.LastSeenAt,
+			&a.TotalTokens, &a.TotalCost, &a.DetectionCount, &a.AvgRisk, &a.LastSeenAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan agent: %w", err)
 		}
@@ -551,7 +822,7 @@ func (s *ClickHouseStore) QueryCosts(ctx context.Context, orgID, projectID strin
 			sum(completion_tokens) AS total_completion_tokens,
 			sum(cost_usd) AS total_cost,
 			avg(cost_usd) AS avg_cost_per_call
-		FROM spans
+		FROM spans FINAL
 		WHERE org_id = ? AND project_id = ? AND model != ''
 		GROUP BY model
 		ORDER BY total_cost DESC
@@ -590,6 +861,45 @@ type ProjectCostRow struct {
 
 // QueryCostByProject returns cost aggregated by project across the org. This
 // powers the per-project cost dimension of the analytics view (DoD #4).
+// WorkflowCostRow is spend aggregated by workflow (BRD §6). workflow_id lives on
+// the trace roll-up, so this aggregates the traces table (not spans).
+type WorkflowCostRow struct {
+	WorkflowID  string  `json:"workflow_id"`
+	CallCount   uint64  `json:"call_count"`
+	TotalTokens uint64  `json:"total_tokens"`
+	TotalCost   float64 `json:"total_cost"`
+}
+
+// QueryCostByWorkflow returns spend grouped by workflow_id for a project.
+func (s *ClickHouseStore) QueryCostByWorkflow(ctx context.Context, orgID, projectID string) ([]WorkflowCostRow, error) {
+	rows, err := s.conn.Query(ctx, `
+		SELECT
+			workflow_id,
+			count() AS call_count,
+			sum(total_tokens) AS total_tokens,
+			sum(cost_usd) AS total_cost
+		FROM traces FINAL
+		WHERE org_id = ? AND project_id = ? AND workflow_id != ''
+		GROUP BY workflow_id
+		ORDER BY total_cost DESC
+		LIMIT 100`,
+		orgID, projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query cost by workflow: %w", err)
+	}
+	defer rows.Close()
+	var out []WorkflowCostRow
+	for rows.Next() {
+		var c WorkflowCostRow
+		if err := rows.Scan(&c.WorkflowID, &c.CallCount, &c.TotalTokens, &c.TotalCost); err != nil {
+			return nil, fmt.Errorf("scan workflow cost: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (s *ClickHouseStore) QueryCostByProject(ctx context.Context, orgID string) ([]ProjectCostRow, error) {
 	rows, err := s.conn.Query(ctx, `
 		SELECT
@@ -597,7 +907,7 @@ func (s *ClickHouseStore) QueryCostByProject(ctx context.Context, orgID string) 
 			count() AS call_count,
 			sum(prompt_tokens + completion_tokens) AS total_tokens,
 			sum(cost_usd) AS total_cost
-		FROM spans
+		FROM spans FINAL
 		WHERE org_id = ? AND model != ''
 		GROUP BY project_id
 		ORDER BY total_cost DESC
@@ -639,7 +949,7 @@ func (s *ClickHouseStore) QueryCostSummary(ctx context.Context, orgID, projectID
 			count() AS total_calls,
 			sum(prompt_tokens + completion_tokens) AS total_tokens,
 			if(count() > 0, sum(cost_usd) / count(), 0) AS avg_cost_per_call
-		FROM spans
+		FROM spans FINAL
 		WHERE org_id = ? AND project_id = ? AND model != ''`,
 		orgID, projectID,
 	).Scan(&cs.TotalCost, &cs.TotalCalls, &cs.TotalTokens, &cs.AvgCostPerCall)
@@ -657,36 +967,71 @@ type MetricPoint struct {
 	TraceCount   uint64    `json:"trace_count"`
 	ErrorCount   uint64    `json:"error_count"`
 	AvgLatencyMs float64   `json:"avg_latency_ms"`
+	P50LatencyMs float64   `json:"p50_latency_ms"`
 	P95LatencyMs float64   `json:"p95_latency_ms"`
+	P99LatencyMs float64   `json:"p99_latency_ms"`
 	TotalTokens  uint64    `json:"total_tokens"`
 	TotalCost    float64   `json:"total_cost"`
+}
+
+// MetricsFilter carries the window/interval plus optional slicing (agent/model)
+// and a window OffsetSec used for period-over-period comparison (offset=window
+// yields the immediately preceding period).
+type MetricsFilter struct {
+	WindowSec   int
+	IntervalSec int
+	OffsetSec   int
+	AgentID     string
+	Model       string
 }
 
 // QueryMetricsTimeseries returns trace metrics bucketed by intervalSec over the
 // trailing windowSec, for the dashboard's Metrics view (latency, throughput,
 // error rate, tokens, cost over time).
-func (s *ClickHouseStore) QueryMetricsTimeseries(ctx context.Context, orgID, projectID string, windowSec, intervalSec int) ([]MetricPoint, error) {
-	if intervalSec <= 0 {
-		intervalSec = 300
+func (s *ClickHouseStore) QueryMetricsTimeseries(ctx context.Context, orgID, projectID string, f MetricsFilter) ([]MetricPoint, error) {
+	interval := f.IntervalSec
+	if interval <= 0 {
+		interval = 300
 	}
-	if windowSec <= 0 {
-		windowSec = 86400
+	window := f.WindowSec
+	if window <= 0 {
+		window = 86400
 	}
+	offset := f.OffsetSec
+	if offset < 0 {
+		offset = 0
+	}
+
+	where := "org_id = ? AND project_id = ?"
+	args := []any{interval, orgID, projectID}
+	if f.AgentID != "" {
+		where += " AND agent_id = ?"
+		args = append(args, f.AgentID)
+	}
+	if f.Model != "" {
+		where += " AND agent_id != '' AND trace_id IN (SELECT DISTINCT trace_id FROM spans FINAL WHERE org_id = ? AND project_id = ? AND model = ?)"
+		args = append(args, orgID, projectID, f.Model)
+	}
+	// Trailing window shifted back by offset (offset=window → previous period).
+	where += " AND started_at >= now() - toIntervalSecond(?) AND started_at < now() - toIntervalSecond(?)"
+	args = append(args, window+offset, offset)
+
 	rows, err := s.conn.Query(ctx, `
 		SELECT
 			toStartOfInterval(started_at, toIntervalSecond(?)) AS bucket,
 			count() AS trace_count,
 			countIf(status = 'error') AS error_count,
 			avg(latency_ms) AS avg_latency,
+			quantile(0.5)(latency_ms) AS p50_latency,
 			quantile(0.95)(latency_ms) AS p95_latency,
+			quantile(0.99)(latency_ms) AS p99_latency,
 			sum(total_tokens) AS total_tokens,
 			sum(cost_usd) AS total_cost
-		FROM traces
-		WHERE org_id = ? AND project_id = ?
-		  AND started_at >= now() - toIntervalSecond(?)
+		FROM traces FINAL
+		WHERE `+where+`
 		GROUP BY bucket
 		ORDER BY bucket ASC`,
-		intervalSec, orgID, projectID, windowSec,
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query metrics timeseries: %w", err)
@@ -698,7 +1043,8 @@ func (s *ClickHouseStore) QueryMetricsTimeseries(ctx context.Context, orgID, pro
 		var p MetricPoint
 		if err := rows.Scan(
 			&p.Bucket, &p.TraceCount, &p.ErrorCount,
-			&p.AvgLatencyMs, &p.P95LatencyMs, &p.TotalTokens, &p.TotalCost,
+			&p.AvgLatencyMs, &p.P50LatencyMs, &p.P95LatencyMs, &p.P99LatencyMs,
+			&p.TotalTokens, &p.TotalCost,
 		); err != nil {
 			return nil, fmt.Errorf("scan metric point: %w", err)
 		}
@@ -707,7 +1053,39 @@ func (s *ClickHouseStore) QueryMetricsTimeseries(ctx context.Context, orgID, pro
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate metrics: %w", err)
 	}
-	return points, nil
+	return zeroFillBuckets(points, window, interval, offset), nil
+}
+
+// zeroFillBuckets emits a point for every interval in the window, including
+// empty ones (as zeros), so idle gaps render as zero instead of an interpolated
+// straight line. Buckets align to interval multiples of the epoch, matching
+// ClickHouse toStartOfInterval.
+func zeroFillBuckets(points []MetricPoint, windowSec, intervalSec, offsetSec int) []MetricPoint {
+	if intervalSec <= 0 {
+		return points
+	}
+	step := int64(intervalSec)
+	now := time.Now().Unix() - int64(offsetSec)
+	end := (now / step) * step
+	start := ((now - int64(windowSec)) / step) * step
+	// Guard against an unreasonable bucket count (belt-and-suspenders; the
+	// handler already bounds window/interval).
+	if (end-start)/step > 20000 {
+		return points
+	}
+	byBucket := make(map[int64]MetricPoint, len(points))
+	for _, p := range points {
+		byBucket[p.Bucket.Unix()] = p
+	}
+	out := make([]MetricPoint, 0, (end-start)/step+1)
+	for t := start; t <= end; t += step {
+		if p, ok := byBucket[t]; ok {
+			out = append(out, p)
+		} else {
+			out = append(out, MetricPoint{Bucket: time.Unix(t, 0).UTC()})
+		}
+	}
+	return out
 }
 
 // WindowCostUSD returns total spend in the trailing windowSec for a project —
@@ -718,12 +1096,35 @@ func (s *ClickHouseStore) WindowCostUSD(ctx context.Context, orgID, projectID st
 	}
 	var cost float64
 	err := s.conn.QueryRow(ctx, `
-		SELECT sum(cost_usd) FROM traces
+		SELECT sum(cost_usd) FROM traces FINAL
 		WHERE org_id = ? AND project_id = ? AND started_at >= now() - toIntervalSecond(?)`,
 		orgID, projectID, windowSec,
 	).Scan(&cost)
 	if err != nil {
 		return 0, fmt.Errorf("query window cost: %w", err)
+	}
+	return cost, nil
+}
+
+// MonthToDateCostUSD returns spend since the start of the current month. An
+// empty projectID means org-wide (all projects). Used for budget consumption
+// and forecasting.
+func (s *ClickHouseStore) MonthToDateCostUSD(ctx context.Context, orgID, projectID string) (float64, error) {
+	var cost float64
+	var err error
+	if projectID == "" {
+		err = s.conn.QueryRow(ctx,
+			`SELECT sum(cost_usd) FROM traces FINAL WHERE org_id = ? AND started_at >= toStartOfMonth(now())`,
+			orgID,
+		).Scan(&cost)
+	} else {
+		err = s.conn.QueryRow(ctx,
+			`SELECT sum(cost_usd) FROM traces FINAL WHERE org_id = ? AND project_id = ? AND started_at >= toStartOfMonth(now())`,
+			orgID, projectID,
+		).Scan(&cost)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("query mtd cost: %w", err)
 	}
 	return cost, nil
 }
