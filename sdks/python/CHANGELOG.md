@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/splyntra/splyntra/compare/splyntra-v1.1.0...splyntra-v1.2.0) (2026-07-03)
+
+
+### Features
+
+* fix overall codebase production grade ([261addb](https://github.com/splyntra/splyntra/commit/261addbd39ffa37a8cb2cafce3e915f136e13034))
+
 ## [1.1.0](https://github.com/splyntra/splyntra/compare/splyntra-v1.0.0...splyntra-v1.1.0) (2026-06-30)
 
 
