@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/splyntra/splyntra/compare/sdk-v1.2.0...sdk-v1.3.0) (2026-07-03)
+
+
+### Features
+
+* fix overall codebase production grade ([261addb](https://github.com/splyntra/splyntra/commit/261addbd39ffa37a8cb2cafce3e915f136e13034))
+
 ## [1.2.0](https://github.com/splyntra/splyntra/compare/sdk-v1.1.0...sdk-v1.2.0) (2026-07-01)
 
 
