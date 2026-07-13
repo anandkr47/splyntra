@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/splyntra/splyntra/compare/dashboard-v1.5.0...dashboard-v1.6.0) (2026-07-13)
+
+
+### Features
+
+* fix overall error handeling and fallbacks ([5d3f0f3](https://github.com/splyntra/splyntra/commit/5d3f0f3fd742167e6be269943ae3af7212136a27))
+
 ## [1.5.0](https://github.com/splyntra/splyntra/compare/dashboard-v1.4.0...dashboard-v1.5.0) (2026-07-12)
 
 
