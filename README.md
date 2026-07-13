@@ -21,12 +21,23 @@
 ## Quick Start
 
 ```bash
-# Start everything (one command)
+# Start the full stack (dashboard, collector, detectors, eval, and infra)
 docker compose up -d
-
-# Dashboard: http://localhost:3000
-# Collector (OTLP): http://localhost:4318
 ```
+
+| Service | URL | Notes |
+|---------|-----|-------|
+| Dashboard | http://localhost:3000 | Traces, logs, evals, security, cost |
+| Collector (OTLP) | http://localhost:4318 | `/v1/traces`, `/v1/logs`, ingest + query API |
+
+Database migrations (ClickHouse + Postgres) are applied automatically by the
+containers on first start — there is no separate migrate step for local dev.
+
+> **API keys.** `splyntra_dev_key` below is a **development-only** fallback that
+> is accepted only when the stack runs with `ENV`/`NODE_ENV=development` (the
+> default for `docker compose`). For any non-local deployment, generate a real
+> key in **Settings → API Keys** and pass it via the `SPLYNTRA_API_KEY`
+> environment variable — the dev key is rejected in production (fail-closed).
 
 ### Instrument Your Agent (Python)
 
@@ -35,15 +46,22 @@ pip install splyntra
 ```
 
 ```python
-from splyntra import Splyntra, trace_agent, trace_tool, trace_llm
+import os
+from splyntra import Splyntra, trace_agent, trace_tool, trace_llm, log
 
-# Initialize (one line)
-splyntra = Splyntra(api_key="splyntra_dev_key", project="my-project")
+# Initialize once. Reads SPLYNTRA_API_KEY from the environment in production;
+# falls back to the dev key only for local docker compose.
+splyntra = Splyntra(
+    api_key=os.getenv("SPLYNTRA_API_KEY", "splyntra_dev_key"),
+    project="my-project",
+    endpoint=os.getenv("SPLYNTRA_ENDPOINT", "http://localhost:4318"),
+)
 
 @trace_agent(name="support_agent", workflow="refund")
 def run_agent(query: str):
     plan = call_llm(query)
     result = execute_tool(plan)
+    log.info("refund handled", {"amount": plan.get("amount")})  # trace-correlated, redacted
     return result
 
 @trace_llm(model="gpt-4o", provider="openai")
@@ -57,9 +75,15 @@ def execute_tool(action: dict):
     ...
 ```
 
-Run your agent. Open `http://localhost:3000/traces`. See your trace — complete with risk scoring for leaked secrets, exposed PII, and suspected prompt injection.
+Run your agent, then open the dashboard:
+
+- **[/traces](http://localhost:3000/traces)** — the execution trace, with unified risk scoring for leaked secrets, exposed PII, prompt injection, content moderation, and unsafe tool calls.
+- **[/logs](http://localhost:3000/logs)** — structured, trace-correlated logs (redacted like spans).
 
 **Time to first trace: under 5 minutes.**
+
+> For frameworks, skip the decorators and pass `instrument=["openai", "langgraph", …]`
+> to `Splyntra(...)` for automatic tracing. See the [Python SDK](sdks/python/README.md).
 
 ### Instrument Your Agent (TypeScript / JavaScript)
 
@@ -68,12 +92,13 @@ npm install @splyntra/sdk
 ```
 
 ```ts
-import { Splyntra, wrapAgent, wrapTool, wrapLLM } from "@splyntra/sdk";
+import { Splyntra, wrapAgent, wrapTool, wrapLLM, log } from "@splyntra/sdk";
 
 // Initialize once (auto-instruments the listed frameworks).
 new Splyntra({
-  apiKey: "splyntra_dev_key",
+  apiKey: process.env.SPLYNTRA_API_KEY ?? "splyntra_dev_key",
   project: "my-project",
+  endpoint: process.env.SPLYNTRA_ENDPOINT ?? "http://localhost:4318",
   instrument: ["openai", "langgraph"],
 });
 
@@ -83,11 +108,14 @@ const readCrm = wrapTool(async (id: string) => db.get(id), "crm.read");
 const runAgent = wrapAgent(async (q: string) => callLLM(q), "support_agent", "refund");
 
 await runAgent("refund my order");
+log.info("refund handled", { amount: 80 }); // trace-correlated, redacted
 ```
 
 TypeScript users can use `@traceAgent` / `@traceTool` / `@traceLLM` decorators instead
 (requires `experimentalDecorators`). Plain JavaScript works via `require("@splyntra/sdk")`.
-See [`sdks/typescript/README.md`](sdks/typescript/README.md) and [`examples/quickstart.ts`](examples/quickstart.ts).
+The package also ships a `splyntra` CLI to gate CI on eval regressions
+(`splyntra eval run --gate`). See [`sdks/typescript/README.md`](sdks/typescript/README.md)
+and [`examples/quickstart.ts`](examples/quickstart.ts).
 
 ---
 
@@ -97,17 +125,17 @@ Five pillars on one pipeline — Observe, Evaluate, Secure, Govern, Trust.
 
 | Pillar | Capabilities | Quality |
 |--------|--------------|---------|
-| **Observability** | Execution tracing, agent replay, time-series metrics, cost analytics (run/model/project) | ✅ GA |
-| **Evaluation** | Dataset management, scorers (exact/rule/tool-call/latency/cost), regression detection, CI gate (+ LLM-as-judge in the commercial edition) | ✅ GA |
-| **Security** | Secret + PII detection (reliable), prompt-injection (beta), unified risk scoring | ✅ GA / ⚠️ BETA |
-| **Governance** | Activity Ledger (hash-chained), Delegation (permissions, spend, approvals), Policy engine (RBAC/ABAC/ReBAC) | 💼 Commercial |
-| **Dashboard** | Projects, alerts (risk + cost), team management (RBAC + login) | ✅ GA |
+| **Observability** | Execution tracing, agent replay, structured trace-correlated logs, time-series metrics, cost analytics (run/model/project) | ✅ GA |
+| **Evaluation** | Dataset management, scorers (exact/rule/tool-call/latency/cost/groundedness), version-over-version regression, benchmark leaderboard, CI gate via the `splyntra` CLI — Python **and** TypeScript (+ LLM-as-judge in the commercial edition) | ✅ GA |
+| **Security** | Secret + PII detection, content moderation, tool-guard, prompt-injection (beta) — all feeding one risk score; inline block/redact guard | ✅ GA / ⚠️ BETA |
+| **Governance** | Activity Ledger (hash-chained), Delegation (self-service permissions, spend limits, approval workflow), Policy engine (RBAC/ABAC/ReBAC) | 💼 Commercial |
+| **Dashboard** | Projects, alerts (risk + cost), team management (RBAC + login), searchable/sortable/paginated tables with Excel export | ✅ GA |
 
 > 💼 Governance, identity/SSO, the control plane, billing, and advanced
 > detectors/scorers are the **commercial edition** (the private `splyntra-cloud`
 > repository); the open core is fully usable without them. See [LICENSING.md](LICENSING.md).
 
-**Integrations:** OpenAI, LangGraph, OpenAI Agents, CrewAI (SDK) · Dify, n8n (webhook). See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
+**Integrations (auto-instrument):** OpenAI, Anthropic, Ollama, LangGraph, OpenAI Agents, CrewAI, MCP, LlamaIndex, Chroma — plus Google ADK & Pydantic AI (Python) · Dify, n8n (webhook). See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
 ---
 

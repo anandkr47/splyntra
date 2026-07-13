@@ -119,12 +119,39 @@ class SupportAgent {
 | `framework`       | —                       | Framework label shown on the Agents page       |
 | `redactByDefault` | `true`                  | Strip secrets from spans before export         |
 | `instrument`      | `[]`                    | Frameworks to auto-instrument                  |
+| `guard`           | `"off"`                 | Inline guardrail: `"off"`, `"monitor"`, `"block"` |
+| `guardFailOpen`   | `true`                  | On a guard-service error, proceed vs block     |
 
 ## Client-Side Redaction
 
 High-confidence secrets (AWS keys, JWTs, bearer tokens, API keys) are stripped from span attributes **before they leave your process**. The collector applies a second pass on ingest as defence-in-depth.
 
 Disable with `redactByDefault: false` (not recommended for production).
+
+## Inline Guard
+
+Run a fast, high-confidence check *before* a model/tool call completes so you can
+block or redact rather than only detect after the fact. Enable it at init with
+`guard: "monitor"` (log only) or `guard: "block"` (throws on a high-confidence
+prompt-injection match); auto-instrumented frameworks call it in a pre-flight hook.
+
+```ts
+import { Splyntra, SplyntraBlocked } from "@splyntra/sdk";
+
+new Splyntra({ apiKey: "...", project: "my-app", guard: "block", instrument: ["openai"] });
+
+try {
+  await runAgent(userInput);
+} catch (e) {
+  if (e instanceof SplyntraBlocked) handleBlocked(e); // high-precision injection pre-flight
+  else throw e;
+}
+```
+
+Secrets are redacted in place; only high-precision injection signatures block, so
+benign role-play prompts pass through (deep analysis stays on the async detector
+path). `guardFailOpen: true` (default) proceeds if the guard service is
+unreachable — set `false` to fail closed.
 
 ## Graceful Shutdown
 
