@@ -14,8 +14,12 @@ across two licenses; the commercial layer lives in a separate private repository
 | **`sdks/python/`** (`splyntra`) | **Apache-2.0** | `Apache-2.0` |
 | **`sdks/typescript/`** (`@splyntra/sdk`) | **Apache-2.0** | `Apache-2.0` |
 
-The root `LICENSE` is the AGPL-3.0 text. Each `sdks/*` directory carries its own
-`Apache-2.0` `LICENSE` that overrides the repository default for that subtree.
+The root `LICENSE` is the full AGPL-3.0 text. Each `sdks/*` directory carries its
+own full `Apache-2.0` `LICENSE` that overrides the repository default for that
+subtree. `apps/web/` bundles a copy of the AGPL-3.0 `LICENSE` so the published
+`@splyntra/dashboard` npm package is self-contained. All three published packages
+(`splyntra` on PyPI, `@splyntra/sdk` and `@splyntra/dashboard` on npm) ship their
+license text in the distributed artifact.
 
 ## Why this split
 

@@ -7,7 +7,11 @@
 [![npm](https://img.shields.io/npm/v/@splyntra/dashboard)](https://www.npmjs.com/package/@splyntra/dashboard)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](../../LICENSE)
 
-The Splyntra open dashboard — a composable Next.js application providing trace visualization, agent metrics, cost analytics, evaluation results, alerts, and team management with RBAC.
+The Splyntra open dashboard — a composable Next.js application providing trace
+visualization, structured logs, agent/MCP/platform metrics, cost analytics,
+evaluation results (leaderboard + regression), a security incident feed, alerts,
+and team management with RBAC. Every table supports search, sortable columns,
+selectable page size, and one-click Excel export.
 
 Published as **source** (not a prebuilt library). Consumers compose it with their overlays and run `next build`.
 
@@ -39,6 +43,7 @@ npm run dev                        # http://localhost:3000
 | `POSTGRES_DSN`    | —                                | PostgreSQL connection string         |
 | `COLLECTOR_URL`   | `http://localhost:4318`          | Splyntra Collector base URL         |
 | `EVAL_URL`        | `http://localhost:8002`          | Evaluation service base URL         |
+| `SPLYNTRA_API_KEY`| `splyntra_dev_key` (dev only)    | Collector key the dashboard proxies with; dev fallback is rejected outside `development` (fail-closed) |
 
 ## Scripts
 
@@ -63,12 +68,18 @@ npm run dev                        # http://localhost:3000
 
 | Route             | Purpose                                      |
 |-------------------|----------------------------------------------|
-| `/`               | Dashboard overview                           |
-| `/traces`         | Trace list and detail viewer                 |
-| `/agents`         | Agent registry and status                    |
+| `/`               | Dashboard overview + detailed-report export  |
+| `/connect`        | Connect wizard — guided agent onboarding     |
+| `/traces`         | Trace list and replay/detail viewer          |
+| `/logs`           | Structured, trace-correlated log search      |
+| `/agents`         | Agent registry, per-agent dashboards         |
+| `/mcp`            | Per-MCP-server monitoring (calls, flagged)   |
+| `/platforms`      | Platform workflow/node analytics             |
+| `/tools`          | Tool calls, RAG retrieval, vector search     |
 | `/metrics`        | Time-series observability metrics            |
-| `/costs`          | Token and cost analytics                     |
-| `/evaluations`    | Evaluation runs and regression results       |
+| `/costs`          | Token/cost analytics + model pricing editor  |
+| `/evaluations`    | Datasets, runs, leaderboard, regressions, CI snippet |
+| `/security`       | Security incident feed + severity/detector/agent summary |
 | `/alerts`         | Alert configuration and history              |
 | `/projects`       | Project management                           |
 | `/settings/team`  | Team members, invites, RBAC                  |
