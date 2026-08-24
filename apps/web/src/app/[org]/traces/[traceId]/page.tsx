@@ -117,7 +117,7 @@ export default function TraceDetailPage() {
   const trace = hasTrace ? apiToTrace(traceId, data!) : null;
 
   return (
-    <div className="mx-auto max-w-6xl p-6">
+    <div className="w-full max-w-7xl 2xl:max-w-[1600px] mx-auto p-6 lg:p-8">
       <div className="mb-4">
         <Link
           href={oh("/traces")}

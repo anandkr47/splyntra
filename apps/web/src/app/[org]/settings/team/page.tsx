@@ -68,7 +68,7 @@ export default async function TeamPage() {
   const ownerCount = members.filter((m) => m.role === "owner").length;
 
   return (
-    <div className="mx-auto max-w-4xl p-6 lg:p-8">
+    <div className="w-full max-w-5xl 2xl:max-w-6xl mx-auto p-6 lg:p-8">
       {/* Header (inline — this is a Server Component, so we can't pass the icon
           component as a prop to the client-side PageHeader). */}
       <div className="mb-6 flex items-start gap-3">

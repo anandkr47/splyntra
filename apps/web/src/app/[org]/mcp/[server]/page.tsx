@@ -55,7 +55,7 @@ export default function McpServerDashboardPage() {
   });
 
   return (
-    <div className="mx-auto max-w-5xl px-6 py-8">
+    <div className="w-full max-w-7xl 2xl:max-w-[1600px] mx-auto p-6 lg:p-8">
       <Link href={oh("/mcp")} className="mb-4 inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-900 dark:hover:text-white">
         <ArrowLeft className="h-4 w-4" /> MCP Servers
       </Link>

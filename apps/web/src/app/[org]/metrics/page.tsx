@@ -82,7 +82,7 @@ export default function MetricsPage() {
   const models = useMemo(() => costsData?.models || [], [costsData]);
 
   return (
-    <div className="mx-auto max-w-6xl p-6">
+    <div className="w-full max-w-7xl 2xl:max-w-[1600px] mx-auto p-6 lg:p-8">
       <PageHeader
         icon={LineChartIcon}
         title="Metrics"

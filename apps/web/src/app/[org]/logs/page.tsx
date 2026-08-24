@@ -67,7 +67,7 @@ export default function LogsPage() {
   const total = data?.total ?? 0;
 
   return (
-    <div className="mx-auto max-w-7xl p-6 lg:p-8">
+    <div className="w-full max-w-7xl 2xl:max-w-[1600px] mx-auto p-6 lg:p-8">
       <PageHeader icon={ScrollText} title="Logs" subtitle="Structured, trace-correlated agent logs — searchable, severity-filtered, and redacted." />
       {error && !isLoading && (
         <p className="mb-4 text-xs text-red-500">Could not reach the collector. Check that the stack is running.</p>

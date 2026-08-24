@@ -18,8 +18,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className="min-h-screen bg-[var(--background)] antialiased">
+    <html lang="en" className="light" style={{ colorScheme: "light" }} suppressHydrationWarning>
+      <body className="min-h-screen bg-[#fafbfc] text-gray-900 antialiased" style={{ colorScheme: "light" }}>
         <Providers>
           <AppShell>{children}</AppShell>
         </Providers>

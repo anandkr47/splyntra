@@ -124,7 +124,7 @@ export default function ToolsPage() {
   const failRate = totalCalls > 0 ? (totalFailed / totalCalls) * 100 : 0;
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8">
+    <div className="w-full max-w-7xl 2xl:max-w-[1600px] mx-auto p-6 lg:p-8">
       <PageHeader
         icon={Wrench}
         title="Tools & Retrieval"
